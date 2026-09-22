@@ -522,6 +522,7 @@ enum Setting {
     UnifiedSidebar,
     DockRight,
     SidebarWidth,
+    AbovePercent,
     IconTheme,
     ColorTheme,
     PreviewPlacement,
@@ -1837,6 +1838,7 @@ impl App {
             Activate,
             ToggleSetting(usize),
             AdjustWidth(bool),
+            AdjustAbovePercent(bool),
             DiscardConfirmed(usize, FileEntry),
             DiscardAllConfirmed(usize),
             GitConfirmed(usize, Vec<String>),
@@ -1880,6 +1882,21 @@ impl App {
                 {
                     Cmd::AdjustWidth(true)
                 }
+                // Only while the row is live: it is dimmed under the other
+                // placements, and a dimmed row must not move on an arrow key
+                // any more than it moves on Enter.
+                KeyCode::Left | KeyCode::Char('h')
+                    if settings.get(*selected).map(|row| (row.0, row.3))
+                        == Some((Setting::AbovePercent, true)) =>
+                {
+                    Cmd::AdjustAbovePercent(false)
+                }
+                KeyCode::Right | KeyCode::Char('l')
+                    if settings.get(*selected).map(|row| (row.0, row.3))
+                        == Some((Setting::AbovePercent, true)) =>
+                {
+                    Cmd::AdjustAbovePercent(true)
+                }
                 KeyCode::Enter | KeyCode::Char(' ') => Cmd::ToggleSetting(*selected),
                 _ => Cmd::Nothing,
             },
@@ -1906,6 +1923,7 @@ impl App {
             Cmd::Activate => self.activate_menu_entry(),
             Cmd::ToggleSetting(index) => self.toggle_setting(index),
             Cmd::AdjustWidth(wider) => self.adjust_sidebar_width(wider),
+            Cmd::AdjustAbovePercent(taller) => self.adjust_above_percent(taller),
             Cmd::GitConfirmed(repo, args) => {
                 self.overlay = None;
                 let strs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -2104,6 +2122,12 @@ impl App {
                 true,
             ),
             (
+                Setting::AbovePercent,
+                "Above preview height",
+                format!("{}%", self.sidebar_state.above_percent),
+                self.sidebar_state.preview_placement.stacks_above(),
+            ),
+            (
                 Setting::IconTheme,
                 "Icon theme",
                 match self.theme {
@@ -2228,6 +2252,7 @@ impl App {
                     sidebar::update_state(|state| state.dock_right = !state.dock_right);
             }
             Setting::SidebarWidth => self.adjust_sidebar_width(true),
+            Setting::AbovePercent => self.adjust_above_percent(true),
             Setting::IconTheme => self.set_theme(self.theme.toggled()),
             Setting::ColorTheme => {
                 self.sidebar_state = sidebar::update_state(|state| {
@@ -2237,7 +2262,7 @@ impl App {
             }
             Setting::PreviewPlacement => {
                 self.sidebar_state = sidebar::update_state(|state| {
-                    state.preview_placement = state.preview_placement.other();
+                    state.preview_placement = state.preview_placement.next();
                 });
             }
             Setting::Hotkeys => {
@@ -2275,6 +2300,15 @@ impl App {
                 self.change_folder_dialog();
             }
         }
+    }
+
+    /// Takes effect on the NEXT viewer opened under `above` placement: the
+    /// share is applied when the pane is split in, and a live viewer's height
+    /// is the user's to drag from there.
+    fn adjust_above_percent(&mut self, taller: bool) {
+        self.sidebar_state = sidebar::update_state(|state| {
+            state.above_percent = sidebar::step_above_percent(state.above_percent, taller);
+        });
     }
 
     fn adjust_sidebar_width(&mut self, wider: bool) {
