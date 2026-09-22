@@ -747,6 +747,16 @@ setting are all gone.
   Inline placement never parks or moves the user's panes to another tab, never claims
   `hs-preview-dedicated`, and `q`/Esc closes only the viewer pane. Placement is stamped
   on the viewer with `hs-preview-inline`; do not infer it later from mutable settings.
+- `Preview opens in: above` is the same inline viewer, differing ONLY at spawn: it
+  splits the tab's largest non-plugin pane (`launch::work_panes_in_tab`) DOWN and swaps,
+  so the viewer sits on top and that pane (usually the agent) keeps its full width. It
+  stamps the same `hs-preview-inline`, so `pane` and `above` reuse each other's viewer
+  and flipping between them never spawns a second one. With no work pane in the tab it
+  falls back to the `pane` geometry, and so does a split whose target vanished — the
+  only placement whose target is a pane the USER can close. Spawned in place rather
+  than restacked afterwards because of the same-tab `pane.move` no-op above; worth
+  adding to that entry is what the bounce costs HERE, which is that the temporary tab's
+  `tab.created` fires our own `--ensure` and docks a stray sidebar into it.
 - Why the inversion: full-size mode evacuated the CURRENT tab (parking the user's
   terminals into a background "· preview" tab), and the park plan was keyed by the
   SIDEBAR's pane id — which churns on every redeploy and every ensure-hook heal. The

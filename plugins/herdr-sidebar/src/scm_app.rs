@@ -2185,7 +2185,7 @@ impl App {
             }
             Setting::PreviewPlacement => {
                 self.sidebar_state = sidebar::update_state(|state| {
-                    state.preview_placement = state.preview_placement.other();
+                    state.preview_placement = state.preview_placement.next();
                 });
             }
             Setting::Hotkeys => {
