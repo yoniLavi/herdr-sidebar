@@ -2123,7 +2123,9 @@ fn draw_editor(
 /// existing tab, else overwrite the one ephemeral tab, else create a tab.
 ///
 /// In `Pane` placement there is exactly ONE viewer pane per tab, split in
-/// beside the sidebar and reused for every later click. Pinning is meaningless
+/// beside the sidebar and reused for every later click. `Above` placement is
+/// the same single viewer, split in above the tab's largest work pane
+/// instead; the two only differ at spawn time. Pinning is meaningless
 /// without a tab of its own, so an inline viewer is always reusable — a dirty
 /// editor is protected by the viewer's own unsaved-changes prompt on the
 /// control-file switch, not by refusing to route to it (refusing would split
@@ -2197,8 +2199,14 @@ pub fn open_in_pane(
         });
     }
 
-    // 3. Nothing reusable — a pane beside the sidebar, or a tab of its own.
+    // 3. Nothing reusable — a pane beside the sidebar (or above the tab's
+    // main pane), or a tab of its own.
     if inline {
+        let above_of = if state.preview_placement.stacks_above() {
+            crate::launch::work_panes_in_tab(&list, &caller_tab_id)
+        } else {
+            Vec::new()
+        };
         spawn_inline_pane(
             my_pane_id,
             spawn_cwd,
@@ -2207,6 +2215,7 @@ pub fn open_in_pane(
             &caller_tab_id,
             state.dock_right,
             state.sidebar_width,
+            &above_of,
         )
     } else {
         spawn_preview_tab(my_pane_id, spawn_cwd, doc_key, payload, &origin_tab_id)
@@ -2307,10 +2316,12 @@ fn spawn_preview_tab(
     })
 }
 
-/// Spawn the tab's one inline viewer pane, beside the sidebar on the side
-/// away from its dock edge, and leave focus in the sidebar: the preview is
-/// visible right there, so stealing focus would only stop the user from
-/// walking the tree with the arrow keys.
+/// Spawn the tab's one inline viewer pane — beside the sidebar on the side
+/// away from its dock edge, or, when `above_of` names the tab's work panes,
+/// stacked above the largest of them — and leave focus in the sidebar: the
+/// preview is visible right there, so stealing focus would only stop the
+/// user from walking the tree with the arrow keys.
+#[allow(clippy::too_many_arguments)]
 fn spawn_inline_pane(
     my_pane_id: &str,
     spawn_cwd: &Path,
@@ -2319,6 +2330,7 @@ fn spawn_inline_pane(
     caller_tab_id: &str,
     dock_right: bool,
     sidebar_cols: u16,
+    above_of: &[String],
 ) -> Result<PreviewTarget, String> {
     let (new_pane, control) = spawn_viewer_pane(
         my_pane_id,
@@ -2329,6 +2341,7 @@ fn spawn_inline_pane(
             dock_right,
             sidebar_cols,
         }),
+        above_of,
     )?;
     // A swap moves the FOCUSED SLOT's occupant, not the focus: when the plan
     // swapped us out of our own slot, focus is now sitting on the brand-new
@@ -2677,24 +2690,74 @@ fn fallback_inline_split_plan(pane_id: &str, inline: InlineSpawn) -> SplitPlan {
     }
 }
 
+/// `above` placement: the viewer's share of the pane it is stacked over.
+/// `ratio` is the ORIGINAL pane's share and the swap trades occupants while
+/// the slots keep their sizes, so after the swap the viewer owns exactly the
+/// slot the split target was given.
+const ABOVE_VIEWER_SHARE: f64 = 0.6;
+
+/// Where an `above` viewer goes: split the LARGEST of the tab's own panes
+/// (`work_panes`, i.e. never a sidebar or another viewer) downward, then swap
+/// so the viewer sits on top and the split pane keeps its full width below.
+///
+/// `None` when no work pane appears in the layout (the sidebar is alone in
+/// its tab) — the caller falls back to splitting beside the sidebar. Equal
+/// areas keep the first pane in `work_panes` order, so the choice is stable.
+fn above_split_plan(layout_json: &str, work_panes: &[String]) -> Option<SplitPlan> {
+    let panes = layout_panes(layout_json)?;
+    let mut best: Option<(&str, i64)> = None;
+    for id in work_panes {
+        let Some(rect) = panes
+            .iter()
+            .find(|p| p.pane_id.as_deref() == Some(id.as_str()))
+            .and_then(|p| p.rect.as_ref())
+        else {
+            continue;
+        };
+        let area = rect.width.max(0) * rect.height.max(0);
+        if area > 0 && best.is_none_or(|(_, best_area)| area > best_area) {
+            best = Some((id, area));
+        }
+    }
+    best.map(|(target, _)| SplitPlan {
+        target: target.to_string(),
+        ratio: ABOVE_VIEWER_SHARE,
+        swap: true,
+    })
+}
+
+/// `above_of` lists the tab's work panes when the viewer should be stacked
+/// above the largest of them (`above` placement); empty keeps it beside the
+/// sidebar, and is also the fallback when none of them can be placed.
 fn spawn_viewer_pane(
     my_pane_id: &str,
     spawn_cwd: &Path,
     doc_key: &str,
     payload: &str,
     inline: Option<InlineSpawn>,
+    above_of: &[String],
 ) -> Result<(String, PathBuf), String> {
     let control = fresh_control_path();
     write_scratch_file(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
     let layout = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": my_pane_id })).ok();
-    let plan = match inline {
-        Some(inline) => layout
+    let above = if inline.is_some() && !above_of.is_empty() {
+        layout
+            .as_deref()
+            .and_then(|json| above_split_plan(json, above_of))
+    } else {
+        None
+    };
+    // Splits only go right or down: `above` is a down-split plus a swap.
+    let direction = if above.is_some() { "down" } else { "right" };
+    let plan = match (above, inline) {
+        (Some(plan), _) => plan,
+        (None, Some(inline)) => layout
             .as_deref()
             .and_then(|json| inline_split_plan(json, my_pane_id, inline))
             .unwrap_or_else(|| fallback_inline_split_plan(my_pane_id, inline)),
         // Tab placement: the pane is moved out immediately, so this geometry
         // only has to be legal, never pretty.
-        None => {
+        (None, None) => {
             let neighbor = layout
                 .as_deref()
                 .and_then(|json| side_neighbor(json, my_pane_id, false));
@@ -2716,7 +2779,7 @@ fn spawn_viewer_pane(
         "pane.split",
         serde_json::json!({
             "target_pane_id": plan.target,
-            "direction": "right",
+            "direction": direction,
             "ratio": plan.ratio,
             "focus": false,
             "cwd": spawn_cwd.display().to_string(),
@@ -3562,6 +3625,64 @@ mod tests {
     const SIDEBAR_RIGHT: &str = r#"
         {"pane_id":"w1:p2","rect":{"x":0,"y":0,"width":148,"height":50}},
         {"pane_id":"w1:p1","rect":{"x":148,"y":0,"width":32,"height":50}}"#;
+
+    /// `above` stacks the viewer over the tab's largest work pane: a DOWN
+    /// split that keeps the target's slot at the viewer's share, then a swap
+    /// so the viewer is on top and the work pane keeps its full width.
+    #[test]
+    fn an_above_preview_stacks_over_the_largest_work_pane() {
+        let work = vec!["w1:p2".to_string()];
+        assert_eq!(
+            above_split_plan(&layout(SIDEBAR_LEFT), &work),
+            Some(SplitPlan {
+                target: "w1:p2".into(),
+                ratio: ABOVE_VIEWER_SHARE,
+                swap: true
+            })
+        );
+        // The dock edge is irrelevant: the sidebar is never a candidate.
+        assert_eq!(
+            above_split_plan(&layout(SIDEBAR_RIGHT), &work).map(|plan| plan.target),
+            Some("w1:p2".into())
+        );
+
+        // Sidebar | agent over shell: the agent is bigger, so it is the one
+        // split, and the smaller shell is left alone.
+        let stacked = layout(
+            r#"
+            {"pane_id":"w1:p1","rect":{"x":0,"y":0,"width":32,"height":50}},
+            {"pane_id":"w1:p3","rect":{"x":32,"y":35,"width":148,"height":15}},
+            {"pane_id":"w1:p2","rect":{"x":32,"y":0,"width":148,"height":35}}"#,
+        );
+        let both = vec!["w1:p3".to_string(), "w1:p2".to_string()];
+        assert_eq!(
+            above_split_plan(&stacked, &both).map(|plan| plan.target),
+            Some("w1:p2".into())
+        );
+
+        // Equal areas keep the first work pane, so the choice is stable.
+        let halves = layout(
+            r#"
+            {"pane_id":"w1:p2","rect":{"x":0,"y":0,"width":90,"height":50}},
+            {"pane_id":"w1:p3","rect":{"x":90,"y":0,"width":90,"height":50}}"#,
+        );
+        assert_eq!(
+            above_split_plan(&halves, &both).map(|plan| plan.target),
+            Some("w1:p3".into())
+        );
+    }
+
+    /// With nothing to stack over, `above` yields no plan and the spawn falls
+    /// back to the ordinary beside-the-sidebar split rather than failing.
+    #[test]
+    fn an_above_preview_without_a_work_pane_has_no_plan() {
+        let alone = layout(r#"{"pane_id":"w1:p1","rect":{"x":0,"y":0,"width":180,"height":50}}"#);
+        assert_eq!(above_split_plan(&alone, &[]), None);
+        // A work pane the layout does not describe (another tab, or gone
+        // since the list was taken) is skipped, not guessed at.
+        assert_eq!(above_split_plan(&alone, &["w9:p9".to_string()]), None);
+        assert_eq!(above_split_plan("garbage", &["w1:p1".to_string()]), None);
+    }
 
     /// The inline viewer goes between the sidebar and the user's panes, on
     /// whichever side is away from the dock edge — the sidebar must not be

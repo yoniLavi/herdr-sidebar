@@ -45,7 +45,8 @@ Use the mouse or press `1`, `2`, and `3`.
 - Navigate a real expandable tree with file icons, hover actions, Git decorations, and
   `m` / Ctrl+right-click context menus.
 - Click a file to reuse an ephemeral preview tab; double-click to pin it. Preview in the
-  same tab instead by setting **Preview opens in** to `pane`.
+  same tab instead by setting **Preview opens in** to `pane` (beside the sidebar) or
+  `above` (stacked over the tab's largest pane, e.g. your agent, which keeps its full width).
 - Preview text, Markdown, images, and—when `ffmpeg` is available—video poster frames.
   Read-only previews support mouse selection and clipboard copy.
 - Find files with `Ctrl+P`; search project contents with `Ctrl+F` or `Ctrl+Shift+F`.
