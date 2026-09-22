@@ -56,7 +56,8 @@ pub const SPAWN_CWD_ENV: &str = "HERDR_SIDEBAR_SPAWN_CWD";
 pub const PREVIEW_CONTROL_ENV: &str = "HERDR_SIDEBAR_PREVIEW_CONTROL";
 
 /// Set on viewer panes spawned into the sidebar's own tab
-/// ([`PreviewPlacement::Pane`]). A viewer's placement is fixed by where its
+/// ([`PreviewPlacement::Pane`] or [`PreviewPlacement::Above`], which differ
+/// only in where the pane is split in). A viewer's placement is fixed by where its
 /// pane physically sits, so it travels with the process rather than being
 /// re-read from the settings file, which the user can flip mid-life.
 pub const PREVIEW_INLINE_ENV: &str = "HERDR_SIDEBAR_PREVIEW_INLINE";
@@ -216,12 +217,15 @@ impl ColorTheme {
 
 /// Where a preview, diff or `git show` opens. `Tab` gives every document its
 /// own herdr tab (VS Code editor-tab semantics, the historical default);
-/// `Pane` splits ONE viewer pane into the tab the sidebar already lives in
-/// and reuses it for every later click.
+/// `Pane` splits ONE viewer pane into the tab the sidebar already lives in,
+/// beside the sidebar, and reuses it for every later click. `Above` is the
+/// same single inline viewer, split in above the tab's main pane instead, so
+/// that pane (typically an agent) keeps its full width.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PreviewPlacement {
     Tab,
     Pane,
+    Above,
 }
 
 impl PreviewPlacement {
@@ -229,25 +233,37 @@ impl PreviewPlacement {
         match self {
             Self::Tab => "tab",
             Self::Pane => "pane",
+            Self::Above => "above",
         }
     }
 
-    pub fn other(self) -> Self {
+    /// The value the ⚙ settings row moves to next; the row cycles in place.
+    pub fn next(self) -> Self {
         match self {
             Self::Tab => Self::Pane,
-            Self::Pane => Self::Tab,
+            Self::Pane => Self::Above,
+            Self::Above => Self::Tab,
         }
     }
 
     /// True when previews share the caller's tab instead of getting one.
+    /// `Pane` and `Above` differ only in where a NEW viewer is split in, so
+    /// both keep one viewer per tab and either reuses the other's.
     pub fn is_inline(self) -> bool {
-        matches!(self, Self::Pane)
+        matches!(self, Self::Pane | Self::Above)
+    }
+
+    /// Split the inline viewer in above the tab's main pane rather than
+    /// beside the sidebar.
+    pub fn stacks_above(self) -> bool {
+        matches!(self, Self::Above)
     }
 
     fn from_state_name(name: &str) -> Option<Self> {
         match name {
             "tab" => Some(Self::Tab),
             "pane" => Some(Self::Pane),
+            "above" => Some(Self::Above),
             _ => None,
         }
     }
@@ -1144,6 +1160,10 @@ mod tests {
             parse_state("{\"preview_placement\":\"nonsense\"}").preview_placement,
             PreviewPlacement::Tab
         );
+        assert_eq!(
+            parse_state("{\"preview_placement\":\"above\"}").preview_placement,
+            PreviewPlacement::Above
+        );
         assert_eq!(parse_state("garbage"), State::default());
         assert_eq!(parse_state("{\"active\":\"bogus\"}"), State::default());
     }
@@ -1173,6 +1193,33 @@ mod tests {
             assert_eq!(follow_cwd_setting_value(true), "on");
             assert_eq!(follow_cwd_setting_value(false), "off");
         }
+    }
+
+    #[test]
+    fn preview_placement_cycles_through_every_value_and_round_trips() {
+        let all = [
+            PreviewPlacement::Tab,
+            PreviewPlacement::Pane,
+            PreviewPlacement::Above,
+        ];
+        for placement in all {
+            assert_eq!(
+                PreviewPlacement::from_state_name(placement.label()),
+                Some(placement)
+            );
+        }
+        // Three presses of the settings row visit every value once and land
+        // back where they started.
+        let mut seen = vec![PreviewPlacement::Tab];
+        let mut current = PreviewPlacement::Tab.next();
+        while current != PreviewPlacement::Tab {
+            seen.push(current);
+            current = current.next();
+        }
+        assert_eq!(seen, all);
+        assert!(!PreviewPlacement::Tab.is_inline());
+        assert!(PreviewPlacement::Pane.is_inline() && !PreviewPlacement::Pane.stacks_above());
+        assert!(PreviewPlacement::Above.is_inline() && PreviewPlacement::Above.stacks_above());
     }
 
     #[test]
