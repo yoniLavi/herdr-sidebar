@@ -519,7 +519,7 @@ impl App {
             pending_unified_width: None,
         };
         app.apply_identity();
-        app.request_decorations(true);
+        app.request_decorations();
         app
     }
 
@@ -527,9 +527,10 @@ impl App {
         self.tree.root_path()
     }
 
-    /// Idle work: keep the git decorations current so changes made outside
-    /// the sidebar (an agent editing files, a commit in another pane) show up
-    /// on their own. Self-throttling, so the event loop may call it freely.
+    /// Idle work: keep the tree and the git decorations current so changes
+    /// made outside the sidebar (an agent creating or editing files, a commit
+    /// in another pane) show up on their own. Self-throttling, so the event
+    /// loop may call it freely.
     pub fn tick(&mut self) {
         self.sync_shared_settings();
         self.sync_shared_tree();
@@ -541,7 +542,32 @@ impl App {
         if self.last_deco.elapsed() < DECO_REFRESH {
             return;
         }
-        self.request_decorations(false);
+        self.auto_refresh();
+    }
+
+    /// The idle refresh, on the [`DECO_REFRESH`] cadence: re-list directories
+    /// whose entries changed on disk, then re-read the git decorations.
+    ///
+    /// Gated on this sidebar's TAB being the one in view, not on the sidebar
+    /// PANE having focus. `focused` in `pane.list` is session-global, so a
+    /// focus gate stops all refreshing exactly while you watch the agent
+    /// beside the sidebar, which is when files are changing. The tab gate
+    /// keeps what the backoff is for: sidebars in background tabs (each
+    /// preview tab carries one) stay inert, and catch up within one interval
+    /// of being switched to.
+    ///
+    /// The tree is left alone while an overlay is open, so rows do not shift
+    /// under a menu, prompt or picker the user is in the middle of.
+    fn auto_refresh(&mut self) {
+        self.last_deco = std::time::Instant::now();
+        if !self.pane_is_visible() {
+            return;
+        }
+        if self.overlay.is_none() && self.tree.drop_changed() {
+            self.invalidate_quick_index();
+            self.rebuild();
+        }
+        self.request_decorations();
     }
 
     pub fn is_syncing(&self) -> bool {
@@ -578,7 +604,7 @@ impl App {
         if !enabled {
             self.deco = Decorations::empty();
         }
-        self.request_decorations(true);
+        self.request_decorations();
     }
 
     fn sync_shared_tree(&mut self) {
@@ -619,10 +645,10 @@ impl App {
         }
     }
 
-    /// Queue a status read off the event-loop thread. Preview tabs each carry
-    /// a sidebar, so periodic refreshes back off while this pane is not
-    /// focused; explicit refresh/stage actions pass `force = true`.
-    fn request_decorations(&mut self, force: bool) {
+    /// Queue a status read off the event-loop thread. The periodic caller,
+    /// [`Self::auto_refresh`], backs off in background tabs; explicit
+    /// refresh/stage actions call this directly.
+    fn request_decorations(&mut self) {
         self.last_deco = std::time::Instant::now();
         if !self.sidebar_state.git_deco && !self.sidebar_state.show_git_footer {
             self.deco = Decorations::empty();
@@ -632,7 +658,7 @@ impl App {
             self.deco_backoff_until.clear();
             return;
         }
-        if self.deco_rx.is_some() || (!force && !self.pane_is_focused()) {
+        if self.deco_rx.is_some() {
             return;
         }
         let ignored_backoffs = self.deco_backoff_until.clone();
@@ -714,13 +740,14 @@ impl App {
         }
     }
 
-    fn pane_is_focused(&self) -> bool {
+    /// Whether this sidebar's tab is the one in view (see [`in_focused_tab`]).
+    fn pane_is_visible(&self) -> bool {
         let Some(pane_id) = self.pane_ctl.as_ref().map(|ctl| ctl.pane_id.as_str()) else {
             return true;
         };
         ipc::call_text("pane.list", serde_json::json!({}))
             .ok()
-            .is_some_and(|json| pane_focused_in(&json, pane_id))
+            .is_some_and(|json| in_focused_tab(&json, pane_id))
     }
 
     /// Rediscover the repositories under the current root — after a re-root,
@@ -1939,7 +1966,7 @@ impl App {
             Ok(Ok(summary)) => {
                 self.git_syncing = None;
                 self.notice = Some(summary);
-                self.request_decorations(true);
+                self.request_decorations();
             }
             Ok(Err(error)) => {
                 self.git_syncing = None;
@@ -2644,14 +2671,14 @@ impl App {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.git_deco = !state.git_deco);
                 self.rediscover_repos();
-                self.request_decorations(true);
+                self.request_decorations();
             }
             Setting::GitFooter => {
                 self.sidebar_state = sidebar::update_state(|state| {
                     state.show_git_footer = !state.show_git_footer;
                 });
                 self.rediscover_repos();
-                self.request_decorations(true);
+                self.request_decorations();
             }
             Setting::Folder => {
                 self.overlay = None;
@@ -3007,14 +3034,14 @@ impl App {
             }
             Err(err) => format!("stage failed: {err}"),
         });
-        self.request_decorations(true);
+        self.request_decorations();
     }
 
     fn refresh_tree(&mut self) {
         self.tree.refresh();
         self.invalidate_quick_index();
         self.rediscover_repos();
-        self.request_decorations(true);
+        self.request_decorations();
         self.rebuild();
     }
 
@@ -4551,24 +4578,35 @@ fn truncate_path_tail(label: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
-fn pane_focused_in(pane_list_json: &str, pane_id: &str) -> bool {
+/// Whether `pane_id` sits in the same tab as the session's focused pane.
+///
+/// `focused` in `pane.list` marks ONE pane across the whole session (checked
+/// on herdr 0.9.1 with two workspaces: exactly one `true`), so "my tab holds
+/// the focused pane" is "my tab is the one on screen". Unparseable input, an
+/// unknown pane, or no focused pane at all read as not visible.
+fn in_focused_tab(pane_list_json: &str, pane_id: &str) -> bool {
     let Ok(value) =
         serde_json::from_str::<serde_json::Value>(pane_list_json.trim_start_matches('\u{feff}'))
     else {
         return false;
     };
-    value
+    let Some(panes) = value
         .get("result")
         .and_then(|result| result.get("panes"))
         .and_then(|panes| panes.as_array())
-        .and_then(|panes| {
-            panes
-                .iter()
-                .find(|pane| pane.get("pane_id").and_then(|id| id.as_str()) == Some(pane_id))
-        })
-        .and_then(|pane| pane.get("focused"))
-        .and_then(|focused| focused.as_bool())
-        .unwrap_or(false)
+    else {
+        return false;
+    };
+    let tab_where = |matches: &dyn Fn(&serde_json::Value) -> bool| {
+        panes
+            .iter()
+            .find(|pane| matches(pane))
+            .and_then(|pane| pane.get("tab_id"))
+            .and_then(|tab| tab.as_str())
+    };
+    let mine = tab_where(&|pane| pane.get("pane_id").and_then(|id| id.as_str()) == Some(pane_id));
+    let focused = tab_where(&|pane| pane.get("focused").and_then(|f| f.as_bool()) == Some(true));
+    mine.is_some() && mine == focused
 }
 
 /// The right-aligned decoration for a status letter (issue #19): the letter
@@ -4942,14 +4980,36 @@ mod tests {
     }
 
     #[test]
-    fn focused_pane_detection_is_scoped_to_our_pane_id() {
+    fn visibility_follows_the_focused_tab_not_the_focused_pane() {
+        // The sidebar (w1:p1) is unfocused beside a focused agent (w1:p2): the
+        // case the old focus gate got wrong, since it stopped refreshing here.
         let panes = r#"{"result":{"panes":[
+            {"pane_id":"w1:p1","tab_id":"w1:t1","focused":false},
+            {"pane_id":"w1:p2","tab_id":"w1:t1","focused":true},
+            {"pane_id":"w1:p3","tab_id":"w1:t2","focused":false},
+            {"pane_id":"w2:p1","tab_id":"w2:t1","focused":false}
+        ]}}"#;
+        assert!(in_focused_tab(panes, "w1:p1"));
+        assert!(in_focused_tab(panes, "w1:p2"));
+        assert!(!in_focused_tab(panes, "w1:p3"), "another tab is hidden");
+        assert!(
+            !in_focused_tab(panes, "w2:p1"),
+            "another workspace is hidden"
+        );
+        assert!(!in_focused_tab(panes, "w9:p9"), "an unknown pane is hidden");
+        assert!(!in_focused_tab("garbage", "w1:p1"));
+        let none_focused = r#"{"result":{"panes":[
+            {"pane_id":"w1:p1","tab_id":"w1:t1","focused":false}
+        ]}}"#;
+        assert!(!in_focused_tab(none_focused, "w1:p1"));
+        let no_tab_ids = r#"{"result":{"panes":[
             {"pane_id":"w1:p1","focused":false},
             {"pane_id":"w1:p2","focused":true}
         ]}}"#;
-        assert!(!pane_focused_in(panes, "w1:p1"));
-        assert!(pane_focused_in(panes, "w1:p2"));
-        assert!(!pane_focused_in("garbage", "w1:p2"));
+        assert!(
+            !in_focused_tab(no_tab_ids, "w1:p1"),
+            "None == None is not a match"
+        );
     }
 
     /// The rendered text of a row, decorations included.

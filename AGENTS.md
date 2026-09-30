@@ -665,10 +665,16 @@ HACKING.md — budget time for that before promising a patched build.
   outer `U` and its own aggregate — `Decorations::letter` shows the louder of the two, or
   the folder reads as merely untracked while holding real changes.
 - Refresh runs on ONE background worker per Explorer app, requested on a 2s throttle plus
-  immediately after staging and on `r`/Refresh. Periodic work backs off while that sidebar
-  pane is unfocused — preview tabs each have their own sidebar, so polling every hidden copy
-  multiplies git processes. `⚙ Settings → Git decorations` (persisted `git_deco`, exposed
-  from both views) turns polling off entirely. Separated panes re-read that field from shared
+  immediately after staging and on `r`/Refresh. Periodic work backs off while that sidebar's
+  TAB is not the one in view — preview tabs each have their own sidebar, so polling every
+  hidden copy multiplies git processes. It is keyed on the tab, not on the sidebar pane's
+  focus: `focused` in `pane.list` marks one pane session-wide, so a focus gate stopped all
+  refreshing while you watched the agent beside the sidebar, which is exactly when files
+  change. The same tick re-lists the tree: `Tree::drop_changed` stats each cached
+  directory and evicts those whose mtime moved (entry created/removed/renamed), so new
+  files appear without `r`. Skipped while an overlay is open, so rows never shift under a
+  menu or picker. `⚙ Settings → Git decorations` (persisted `git_deco`, exposed from both
+  views) turns git polling off entirely; the tree re-list is `stat`-only and stays on. Separated panes re-read that field from shared
   state on tick, or toggling it in one view leaves the other's running settings/tree stale.
   Heartbeat/tick collection runs after every event-loop iteration so sustained input cannot
   starve liveness.
@@ -717,8 +723,9 @@ HACKING.md — budget time for that before promising a patched build.
   Local choices use a normal checkout; a remote choice creates its local tracking branch.
   Symbolic `<remote>/HEAD` aliases are omitted. Dirty-worktree checkout failures surface intact
   and never force, stash, discard, or otherwise mutate work to make the switch succeed.
-- Periodic Source Control status/drawer refresh backs off while its pane is unfocused, just
-  like Explorer decorations. Suggestion/sync worker results are still collected first so a
+- Periodic Source Control status/drawer refresh backs off while its pane is unfocused.
+  (Explorer decorations used to share this gate and now key on the pane's tab instead;
+  see above.) Suggestion/sync worker results are still collected first so a
   hidden pane never strands completed background work.
 - Hotkey hints render as keycap chips (`wrap_hints` takes `(key, label)` pairs, shared in
   `ui.rs`). They live in the ⚙ Settings modal; the FOOTER copy is opt-in via the

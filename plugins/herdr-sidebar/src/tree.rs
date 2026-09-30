@@ -1,10 +1,12 @@
 //! Filesystem tree model: which directories are expanded, and the flat list of
-//! visible rows the UI renders. Directory listings are cached and re-read only on
-//! explicit refresh, so redraws never touch the disk.
+//! visible rows the UI renders. Directory listings are cached, so redraws never
+//! touch the disk; they are re-read on explicit refresh, or when
+//! [`Tree::drop_changed`] finds that a listed directory's mtime has moved.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -27,7 +29,9 @@ pub struct Row {
 pub struct Tree {
     root: PathBuf,
     expanded: BTreeSet<PathBuf>,
-    cache: HashMap<PathBuf, Vec<Entry>>,
+    /// Each listing with its directory's mtime as stat'ed BEFORE the read, so
+    /// a change landing during the read still counts as a change next time.
+    cache: HashMap<PathBuf, (Option<SystemTime>, Vec<Entry>)>,
     pub show_hidden: bool,
 }
 
@@ -58,6 +62,21 @@ impl Tree {
     /// Drop all cached listings; the next `rows()` re-reads the disk.
     pub fn refresh(&mut self) {
         self.cache.clear();
+    }
+
+    /// Drop only the cached listings whose directory changed on disk, and say
+    /// whether any did. One `stat` per cached directory and no reads, so it is
+    /// cheap enough to poll.
+    ///
+    /// A directory's mtime moves when an entry in it is created, removed or
+    /// renamed, which is exactly what a listing shows. It does not move when a
+    /// file's contents change, and does not need to: contents are not part of
+    /// the tree, and git decorations have their own refresh. A directory that
+    /// has vanished stats as `None`, so it counts as changed too.
+    pub fn drop_changed(&mut self) -> bool {
+        let before = self.cache.len();
+        self.cache.retain(|dir, (stamp, _)| *stamp == mtime(dir));
+        self.cache.len() != before
     }
 
     pub fn is_expanded(&self, path: &Path) -> bool {
@@ -100,9 +119,10 @@ impl Tree {
     }
 
     fn children(&mut self, dir: &Path) -> Vec<Entry> {
-        if let Some(cached) = self.cache.get(dir) {
+        if let Some((_, cached)) = self.cache.get(dir) {
             return cached.clone();
         }
+        let stamp = mtime(dir);
         let mut entries: Vec<Entry> = fs::read_dir(dir)
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
@@ -124,7 +144,8 @@ impl Tree {
             })
             .unwrap_or_default();
         sort_entries(&mut entries);
-        self.cache.insert(dir.to_path_buf(), entries.clone());
+        self.cache
+            .insert(dir.to_path_buf(), (stamp, entries.clone()));
         entries
     }
 
@@ -160,6 +181,10 @@ impl Tree {
 }
 
 /// VS Code Explorer order: directories first, then files, each case-insensitive.
+fn mtime(dir: &Path) -> Option<SystemTime> {
+    fs::metadata(dir).and_then(|m| m.modified()).ok()
+}
+
 pub fn sort_entries(entries: &mut [Entry]) {
     entries.sort_by(|a, b| {
         b.is_dir
@@ -303,6 +328,57 @@ mod tests {
         assert_eq!(tree.rows().len(), 1, "cached listing must not re-read disk");
         tree.refresh();
         assert_eq!(tree.rows().len(), 2);
+    }
+
+    /// Some filesystems tick directory mtimes coarsely (HFS+ at 1s), so step
+    /// past one tick: the tests then assert the mechanism, not the clock.
+    fn past_mtime_tick() {
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
+
+    #[test]
+    fn drop_changed_picks_up_additions_and_removals() {
+        let tmp = TempDir::new("drop-changed");
+        tmp.touch("one.txt");
+        let mut tree = Tree::new(tmp.0.clone());
+        assert_eq!(tree.rows().len(), 1);
+        assert!(
+            !tree.drop_changed(),
+            "an unchanged directory keeps its listing"
+        );
+        past_mtime_tick();
+        tmp.touch("two.txt");
+        assert!(
+            tree.drop_changed(),
+            "an added entry invalidates the listing"
+        );
+        assert_eq!(tree.rows().len(), 2);
+        past_mtime_tick();
+        std::fs::remove_file(tmp.0.join("one.txt")).unwrap();
+        assert!(
+            tree.drop_changed(),
+            "a removed entry invalidates the listing"
+        );
+        assert_eq!(tree.rows().len(), 1);
+    }
+
+    #[test]
+    fn drop_changed_keeps_unchanged_directories_cached() {
+        let tmp = TempDir::new("drop-changed-scope");
+        tmp.mkdir("sub");
+        tmp.touch("sub/inner.txt");
+        let mut tree = Tree::new(tmp.0.clone());
+        tree.expand(&tmp.0.join("sub"));
+        assert_eq!(tree.rows().len(), 2);
+        past_mtime_tick();
+        tmp.touch("sub/second.txt");
+        assert!(tree.drop_changed());
+        assert!(
+            tree.cache.contains_key(&tmp.0),
+            "the untouched root stays cached"
+        );
+        assert!(!tree.cache.contains_key(&tmp.0.join("sub")));
+        assert_eq!(tree.rows().len(), 3);
     }
 
     #[cfg(unix)]
