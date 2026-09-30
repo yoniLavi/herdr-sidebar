@@ -27,16 +27,17 @@ use herdr_sidebar::branch_ui::{
 };
 use herdr_sidebar::git::{FileEntry, Git, Status};
 use herdr_sidebar::icons::{IconTheme, icon};
+use herdr_sidebar::launchers::{self, Launcher};
 use herdr_sidebar::state::Exit;
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::suggest;
 use herdr_sidebar::ui::{
     TitleAction, activity_button_style, activity_icons, branch_icon, chrome_button_style,
-    draw_activity_caps, draw_scrollbar, gear_icon, hits, hits_activity_button,
-    hits_collapse_button, hover_style, icon_style as ui_icon_style, keep_visible_scroll, palette,
-    selection_style, set_color_theme, sibling_panes_of, sparkle_icon, status_color,
-    title_action_spans, title_actions_visible, title_actions_width, truncate_to, within,
-    wrap_footer_message, wrap_hints,
+    draw_activity_caps, draw_launcher_buttons, draw_scrollbar, gear_icon, hits,
+    hits_activity_button, hits_collapse_button, hover_style, icon_style as ui_icon_style,
+    keep_visible_scroll, palette, selection_style, set_color_theme, sibling_panes_of, sparkle_icon,
+    status_color, title_action_spans, title_actions_visible, title_actions_width, truncate_to,
+    within, wrap_footer_message, wrap_hints,
 };
 
 /// How many log lines the history-ish drawers fetch.
@@ -701,6 +702,11 @@ pub struct App {
     history_target: Option<String>,
     /// One-shot footer notice: (text, is_error). Cleared on the next key press.
     flash: Option<(String, bool)>,
+    /// User-declared activity-bar buttons (see `launchers`), read at startup.
+    launchers: Vec<Launcher>,
+    /// Each launcher button's columns from the last draw; kept out of the
+    /// `Copy` ClickZones because it is a list.
+    launcher_zones: Vec<(u16, u16)>,
     /// Pending ✧ commit-message generation, polled from tick().
     suggesting: Option<Receiver<String>>,
     /// Pending Sync Changes run, polled from tick().
@@ -808,6 +814,15 @@ impl App {
                 repo.cursor = repo.message.len();
             }
         }
+        // A malformed launchers file says so in the footer; buttons that
+        // silently never appear would read as a broken feature.
+        let (loaded_launchers, launchers_flash) = match launchers::load() {
+            Ok(loaded) => (loaded, None),
+            Err(err) => (
+                Vec::new(),
+                Some((format!("launchers not loaded — {err}"), true)),
+            ),
+        };
 
         let mut app = Self {
             repos,
@@ -822,7 +837,9 @@ impl App {
             theme,
             drawers,
             history_target,
-            flash: None,
+            flash: launchers_flash,
+            launchers: loaded_launchers,
+            launcher_zones: Vec::new(),
             suggesting: None,
             syncing: None,
             overlay: None,
@@ -1515,6 +1532,14 @@ impl App {
             }
             if hits_activity_button(z.source_control, z.activity_row, x, y) {
                 return self.switch_to(View::SourceControl);
+            }
+            if let Some(index) = self
+                .launcher_zones
+                .iter()
+                .position(|&bounds| hits_activity_button(bounds, z.activity_row, x, y))
+            {
+                self.run_launcher(index);
+                return None;
             }
         }
         if hits(z.gear, x, y) {
@@ -3589,6 +3614,39 @@ impl App {
         line.push(Span::raw(" ".repeat(pad)));
         line.push(gear);
         frame.render_widget(Paragraph::new(Line::from(line)), area);
+        // `x` is where the view icons end; the launchers sit in the padding.
+        self.launcher_zones = draw_launcher_buttons(
+            frame,
+            &self.launchers,
+            self.theme,
+            area.y,
+            outer_top,
+            outer_bottom,
+            x,
+            gear_x,
+            self.mouse_pos,
+        );
+    }
+
+    /// Run the clicked launcher against the tab's main pane (see
+    /// `launchers::target_pane`), reporting in the footer.
+    fn run_launcher(&mut self, index: usize) {
+        let Some(launcher) = self.launchers.get(index).cloned() else {
+            return;
+        };
+        let target = self.pane_ctl.as_ref().and_then(|ctl| {
+            let list = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})).ok()?;
+            let layout = herdr_sidebar::ipc::call_text(
+                "pane.layout",
+                serde_json::json!({ "pane_id": ctl.pane_id }),
+            )
+            .ok()?;
+            launchers::target_pane(&list, &layout, &ctl.pane_id)
+        });
+        self.flash = Some(match launchers::spawn(&launcher, target) {
+            Ok(()) => (format!("{}: opening", launcher.title), false),
+            Err(err) => (err, true),
+        });
     }
 
     fn draw_header(&mut self, frame: &mut Frame, area: Rect) {

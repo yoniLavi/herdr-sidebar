@@ -321,6 +321,75 @@ pub fn draw_activity_caps(
     frame.render_widget(cap("▀"), Rect::new(bounds.0, outer_bottom, width, 1));
 }
 
+/// Draw the launcher buttons (see [`crate::launchers`]) on the activity bar,
+/// right-aligned so the last one ends one column before `right_edge` (the ⚙
+/// button's left edge). Call AFTER the bar's own line is rendered, since these
+/// are drawn over its padding.
+///
+/// Returns each button's `(start, end)` columns in launcher order, for
+/// hit-testing with [`hits_activity_button`]. When they do not all fit to the
+/// right of `left_edge` (the end of the view icons), none is drawn and the list
+/// is empty: a narrow sidebar drops its launchers rather than overdrawing the
+/// view icons, which are the controls it cannot do without.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_launcher_buttons(
+    frame: &mut Frame,
+    launchers: &[crate::launchers::Launcher],
+    theme: IconTheme,
+    row: u16,
+    outer_top: u16,
+    outer_bottom: u16,
+    left_edge: u16,
+    right_edge: u16,
+    mouse_pos: Option<(u16, u16)>,
+) -> Vec<(u16, u16)> {
+    // Same slack as the view icons: Nerd Font glyphs render two cells wide in
+    // the non-Mono font, so reserve the second cell to keep chips even.
+    let slack = if theme == IconTheme::Material {
+        " "
+    } else {
+        ""
+    };
+    let chips: Vec<String> = launchers
+        .iter()
+        .map(|launcher| format!(" {}{slack} ", launcher.icon(theme)))
+        .collect();
+    let widths: Vec<u16> = chips
+        .iter()
+        .map(|chip| Span::raw(chip.as_str()).width() as u16)
+        .collect();
+    // One blank column after each button, so the last is kept off the ⚙.
+    let total: u16 = widths.iter().map(|w| w + 1).sum();
+    if chips.is_empty() || right_edge < left_edge.saturating_add(total).saturating_add(1) {
+        return Vec::new();
+    }
+    let mut x = right_edge - total;
+    let mut zones = Vec::with_capacity(chips.len());
+    for (chip, width) in chips.into_iter().zip(widths) {
+        let bounds = (x, x + width);
+        let hovered = mouse_pos.is_some_and(|(mx, my)| hits_activity_button(bounds, row, mx, my));
+        if hovered {
+            draw_activity_caps(
+                frame,
+                bounds,
+                outer_top,
+                outer_bottom,
+                palette().activity_hover_bg,
+            );
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                chip,
+                activity_button_style(false, hovered),
+            ))),
+            Rect::new(x, row, width, 1),
+        );
+        zones.push(bounds);
+        x += width + 1;
+    }
+    zones
+}
+
 /// A file-type icon's fixed color, dimmed into legibility when the terminal
 /// background is light. The icon table (`icons::material`) is tuned for a dark
 /// pane — pale yellows and cyans vanish on white — so cap the relative

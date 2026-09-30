@@ -23,14 +23,16 @@ use herdr_sidebar::git::{Git, Status};
 use herdr_sidebar::gitdeco::{Decorations, RepoStatus};
 use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::ipc;
+use herdr_sidebar::launchers::{self, Launcher};
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::tree::{Row, Tree};
 use herdr_sidebar::ui::{
     TitleAction, activity_button_style, activity_icons, chrome_button_style, draw_activity_caps,
-    draw_scrollbar, gear_icon, hits, hits_activity_button, hits_collapse_button, hover_style,
-    icon_style as ui_icon_style, input_tail, keep_visible_scroll, palette, selection_style,
-    set_color_theme, sibling_panes_of, status_color, title_action_icon, title_action_spans,
-    title_actions_visible, title_actions_width, truncate_to, wrap_footer_message, wrap_hints,
+    draw_launcher_buttons, draw_scrollbar, gear_icon, hits, hits_activity_button,
+    hits_collapse_button, hover_style, icon_style as ui_icon_style, input_tail,
+    keep_visible_scroll, palette, selection_style, set_color_theme, sibling_panes_of, status_color,
+    title_action_icon, title_action_spans, title_actions_visible, title_actions_width, truncate_to,
+    wrap_footer_message, wrap_hints,
 };
 
 use herdr_sidebar::state::Exit;
@@ -341,6 +343,11 @@ pub struct App {
     sidebar_state: sidebar::State,
     other_exe: Option<std::path::PathBuf>,
     activity: ActivityZones,
+    /// User-declared activity-bar buttons (see `launchers`), read at startup.
+    launchers: Vec<Launcher>,
+    /// Each launcher button's columns from the last draw; empty when the bar
+    /// was too narrow to show them.
+    launcher_zones: Vec<(u16, u16)>,
     /// The ⚙ button's rect from the last draw (activity bar in unified mode,
     /// header row otherwise).
     gear: Rect,
@@ -469,6 +476,12 @@ impl App {
         } else {
             Vec::new()
         };
+        // A malformed launchers file says so in the footer; buttons that
+        // silently never appear would read as a broken feature.
+        let (loaded_launchers, launchers_notice) = match launchers::load() {
+            Ok(loaded) => (loaded, None),
+            Err(err) => (Vec::new(), Some(format!("launchers not loaded — {err}"))),
+        };
         let mut app = Self {
             tree,
             rows,
@@ -485,10 +498,12 @@ impl App {
             body: BodyGeom::default(),
             overlay: None,
             suspended_search: None,
-            notice: None,
+            notice: launchers_notice,
             sidebar_state,
             other_exe,
             activity: ActivityZones::default(),
+            launchers: loaded_launchers,
+            launcher_zones: Vec::new(),
             gear: Rect::default(),
             title_zones: Vec::new(),
             last_mouse: None,
@@ -1204,6 +1219,12 @@ impl App {
                 }
                 if hits_activity_button(zones.source_control, zones.row, mouse.column, mouse.row) {
                     return self.switch_to(View::SourceControl);
+                }
+                if let Some(index) = self.launcher_zones.iter().position(|&bounds| {
+                    hits_activity_button(bounds, zones.row, mouse.column, mouse.row)
+                }) {
+                    self.run_launcher(index);
+                    return None;
                 }
             }
             let gear = self.gear;
@@ -3617,6 +3638,37 @@ impl App {
         line.push(Span::raw(" ".repeat(pad)));
         line.push(gear);
         frame.render_widget(Paragraph::new(Line::from(line)), area);
+        // `x` is where the view icons end; the launchers sit in the padding.
+        self.launcher_zones = draw_launcher_buttons(
+            frame,
+            &self.launchers,
+            self.theme,
+            area.y,
+            outer_top,
+            outer_bottom,
+            x,
+            gear_x,
+            self.mouse_pos,
+        );
+    }
+
+    /// Run the clicked launcher against the tab's main pane (see
+    /// `launchers::target_pane`), reporting in the footer.
+    fn run_launcher(&mut self, index: usize) {
+        let Some(launcher) = self.launchers.get(index).cloned() else {
+            return;
+        };
+        let target = self.pane_ctl.as_ref().and_then(|ctl| {
+            let list = ipc::call_text("pane.list", serde_json::json!({})).ok()?;
+            let layout =
+                ipc::call_text("pane.layout", serde_json::json!({ "pane_id": ctl.pane_id }))
+                    .ok()?;
+            launchers::target_pane(&list, &layout, &ctl.pane_id)
+        });
+        self.notice = Some(match launchers::spawn(&launcher, target) {
+            Ok(()) => format!("{}: opening", launcher.title),
+            Err(err) => err,
+        });
     }
 
     /// Render the context-menu popup near its anchor, clamped inside the pane,

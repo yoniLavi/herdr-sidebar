@@ -95,6 +95,29 @@ Settings persist across tabs and restarts. Configure:
 The sidebar follows a neighbouring pane's working directory by default. A manually chosen
 folder stays put until that pane changes directory again.
 
+### Launcher buttons
+
+The unified sidebar can carry your own buttons at the right end of its activity bar, left
+of ⚙, which turns it into a small control pane. Declare them in `launchers.json` in the
+plugin's config directory (`herdr plugin config-dir herdr-sidebar`):
+
+```json
+[
+  { "title": "Browser", "icon": "🌐", "nerd_icon": "",
+    "command": ["~/.local/bin/terminal-browser", "open", "--split", "up", "--size", "0.6"] },
+  { "title": "Plugins", "icon": "🧩", "nerd_icon": "",
+    "command": ["herdr", "plugin", "action", "invoke", "open", "--plugin", "ray.plugin-manager"] }
+]
+```
+
+`command` is an argv list, not a shell string. A leading `~/` is expanded, and a bare
+`herdr` means the running herdr. The command runs with `HERDR_PANE_ID` and `HERDR_TAB_ID`
+set to the tab's largest ordinary pane (usually your agent), so pane-aware tools act
+beside or above it rather than on the sidebar. Without a file there are no buttons. A
+malformed file says so in the footer. A sidebar too narrow for the buttons hides them
+rather than crowding the view icons. The file is read when the sidebar starts, so run the
+`redeploy` action after editing it.
+
 ## Keys
 
 | Explorer / Search | Action | Source Control | Action |

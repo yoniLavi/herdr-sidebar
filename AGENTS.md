@@ -477,6 +477,14 @@ HACKING.md — budget time for that before promising a patched build.
   **in process** (instant,
   no flash — the terminal session is held across switches). The old two-crate host/guest
   process-swap protocol is gone.
+- **Launcher buttons** (`launchers.rs`, format in the README) are drawn by BOTH apps'
+  activity bars through one helper, `ui::draw_launcher_buttons`, so the two bars cannot
+  drift apart. They exist only in unified mode, where the bar exists. A launched command
+  gets `HERDR_PANE_ID`/`HERDR_TAB_ID` naming the tab's largest non-plugin pane, not the
+  sidebar: the sidebar is the one pane nothing should open against, and a preview viewer
+  is excluded too, although it is often the largest pane. The file lives in the CONFIG
+  dir because herdr designates that for user-edited files; the sidebar's own settings
+  stay in the state dir. No tool detection: each machine's file lists what it has.
 - User-facing wording is **"Unified sidebar: on/off"**, toggled in the ⚙ Settings modal
   (`s` key or the gear button) — never "merge"/"detach" in UI text, and the toggle is
   silent (the layout change is the feedback). Off spawns a second pane of the same binary
