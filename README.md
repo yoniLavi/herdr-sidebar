@@ -118,6 +118,28 @@ malformed file says so in the footer. A sidebar too narrow for the buttons hides
 rather than crowding the view icons. The file is read when the sidebar starts, so run the
 `redeploy` action after editing it.
 
+### Openers
+
+Some files are better shown by another tool than by the built-in preview: a PDF previews
+here as a "binary file" notice. `openers.json`, beside `launchers.json`, hands files to
+your own command by extension:
+
+```json
+[
+  { "title": "PDF viewer", "extensions": ["pdf"], "command": ["~/.local/bin/open-pdf"] }
+]
+```
+
+Opening a matching file from the Explorer (click, `Enter`, or quick open) runs `command`
+with the file's absolute path appended as the last argument, instead of previewing it.
+Extensions match without regard to case, and the first matching entry wins. The command
+follows the launcher rules above: an argv list, the same `~/` and `herdr` handling, and
+`HERDR_PANE_ID` / `HERDR_TAB_ID` naming your main pane. Without a file nothing changes; a
+malformed file says so in the footer. Run `redeploy` after editing it.
+
+[`contrib/open-pdf`](contrib/open-pdf) is the command in that example: it shows a PDF in
+pdf.js inside [terminal-browser](https://github.com/zenbu-labs/terminal-browser).
+
 ## Keys
 
 | Explorer / Search | Action | Source Control | Action |

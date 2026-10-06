@@ -485,6 +485,17 @@ HACKING.md — budget time for that before promising a patched build.
   is excluded too, although it is often the largest pane. The file lives in the CONFIG
   dir because herdr designates that for user-edited files; the sidebar's own settings
   stay in the state dir. No tool detection: each machine's file lists what it has.
+- **Openers** (`openers.rs`, format in the README) hand a file to a user command by
+  extension, through the launchers' own spawn (`launchers::spawn_command`) so the two
+  cannot disagree about argv, `~/` or the target pane. The hook is `open_preview_at`,
+  the one funnel every Explorer open passes through, so Enter, quick open and search
+  results are covered without each call site knowing. The mouse path checks separately
+  and FIRST, for two reasons that are easy to undo by accident: an opener must outrank
+  the custom editor (a terminal editor on a PDF shows bytes), and a double click's
+  second click must do nothing, since its normal job is pinning a preview tab that an
+  opener never created — falling through would run the command twice. Explorer only:
+  the Source Control view previews diffs, which is still the right thing for a tracked
+  binary.
 - User-facing wording is **"Unified sidebar: on/off"**, toggled in the ⚙ Settings modal
   (`s` key or the gear button) — never "merge"/"detach" in UI text, and the toggle is
   silent (the layout change is the feedback). Off spawns a second pane of the same binary

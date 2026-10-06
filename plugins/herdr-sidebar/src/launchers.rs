@@ -55,9 +55,14 @@ impl Launcher {
 
 /// The launchers file's path, when herdr gave this process a config dir.
 pub fn config_path() -> Option<PathBuf> {
+    config_file(FILE_NAME)
+}
+
+/// `name` inside the plugin's config dir, when herdr gave this process one.
+pub fn config_file(name: &str) -> Option<PathBuf> {
     std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")
         .filter(|dir| !dir.is_empty())
-        .map(|dir| PathBuf::from(dir).join(FILE_NAME))
+        .map(|dir| PathBuf::from(dir).join(name))
 }
 
 /// The declared launchers. An absent file is `Ok(empty)`; an unreadable or
@@ -163,13 +168,24 @@ fn resolve_program(program: &str) -> PathBuf {
 /// reported: these commands open panes and popups and return, and nothing
 /// here waits on that.
 pub fn spawn(launcher: &Launcher, target: Option<(String, String)>) -> Result<(), String> {
-    let (program, args) = launcher
-        .command
+    spawn_command(&launcher.title, &launcher.command, None, target)
+}
+
+/// `spawn`'s body, shared with `openers`: `command` with `trailing` appended as
+/// one final argument when given.
+pub fn spawn_command(
+    title: &str,
+    command: &[String],
+    trailing: Option<&std::path::Path>,
+    target: Option<(String, String)>,
+) -> Result<(), String> {
+    let (program, args) = command
         .split_first()
-        .ok_or_else(|| format!("launcher \"{}\" has an empty command", launcher.title))?;
+        .ok_or_else(|| format!("\"{title}\" has an empty command"))?;
     let mut command = std::process::Command::new(resolve_program(program));
     command
         .args(args)
+        .args(trailing)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -185,7 +201,7 @@ pub fn spawn(launcher: &Launcher, target: Option<(String, String)>) -> Result<()
     }
     let mut child = command
         .spawn()
-        .map_err(|err| format!("{}: could not start {program}: {err}", launcher.title))?;
+        .map_err(|err| format!("{title}: could not start {program}: {err}"))?;
     std::thread::spawn(move || {
         let _ = child.wait();
     });

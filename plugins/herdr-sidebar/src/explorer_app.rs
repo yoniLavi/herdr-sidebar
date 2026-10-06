@@ -24,6 +24,7 @@ use herdr_sidebar::gitdeco::{Decorations, RepoStatus};
 use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::ipc;
 use herdr_sidebar::launchers::{self, Launcher};
+use herdr_sidebar::openers::{self, Opener};
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::tree::{Row, Tree};
 use herdr_sidebar::ui::{
@@ -345,6 +346,9 @@ pub struct App {
     activity: ActivityZones,
     /// User-declared activity-bar buttons (see `launchers`), read at startup.
     launchers: Vec<Launcher>,
+    /// User-declared per-extension open commands (see `openers`), read at
+    /// startup.
+    openers: Vec<Opener>,
     /// Each launcher button's columns from the last draw; empty when the bar
     /// was too narrow to show them.
     launcher_zones: Vec<(u16, u16)>,
@@ -482,6 +486,12 @@ impl App {
             Ok(loaded) => (loaded, None),
             Err(err) => (Vec::new(), Some(format!("launchers not loaded — {err}"))),
         };
+        // Same for openers: a file that silently opens the old way reads as
+        // the feature not working.
+        let (loaded_openers, openers_notice) = match openers::load() {
+            Ok(loaded) => (loaded, None),
+            Err(err) => (Vec::new(), Some(format!("openers not loaded — {err}"))),
+        };
         let mut app = Self {
             tree,
             rows,
@@ -498,11 +508,12 @@ impl App {
             body: BodyGeom::default(),
             overlay: None,
             suspended_search: None,
-            notice: launchers_notice,
+            notice: launchers_notice.or(openers_notice),
             sidebar_state,
             other_exe,
             activity: ActivityZones::default(),
             launchers: loaded_launchers,
+            openers: loaded_openers,
             launcher_zones: Vec::new(),
             gear: Rect::default(),
             title_zones: Vec::new(),
@@ -880,6 +891,9 @@ impl App {
     }
 
     fn open_preview_at(&mut self, path: &Path, line: Option<usize>) {
+        if self.open_with_opener(path) {
+            return;
+        }
         let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) else {
             self.notice = Some("preview needs a herdr pane".into());
             return;
@@ -899,6 +913,34 @@ impl App {
             Ok(target) => self.last_preview = Some((doc_key, target)),
             Err(e) => self.notice = Some(e),
         }
+    }
+
+    /// Hand `path` to the opener that claims its extension, if one does.
+    /// `true` means the file is dealt with (opened, or the failure reported)
+    /// and must not also get a built-in preview.
+    fn open_with_opener(&mut self, path: &Path) -> bool {
+        let Some(opener) = openers::find(&self.openers, path).cloned() else {
+            return false;
+        };
+        let name = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy();
+        self.notice = Some(match openers::spawn(&opener, path, self.launch_target()) {
+            Ok(()) => format!("{}: {name}", opener.title),
+            Err(err) => err,
+        });
+        true
+    }
+
+    /// `(pane, tab)` a launched command should act against: the tab's main
+    /// pane, never the sidebar (see `launchers::target_pane`).
+    fn launch_target(&self) -> Option<(String, String)> {
+        let ctl = self.pane_ctl.as_ref()?;
+        let list = ipc::call_text("pane.list", serde_json::json!({})).ok()?;
+        let layout =
+            ipc::call_text("pane.layout", serde_json::json!({ "pane_id": ctl.pane_id })).ok()?;
+        launchers::target_pane(&list, &layout, &ctl.pane_id)
     }
 
     /// Hide the sidebar: snooze this tab (so the quiet ensure hook doesn't
@@ -1298,6 +1340,13 @@ impl App {
                     // undo the first; explicit chevron clicks always toggle.
                     if folder_click_toggles(on_chevron, double) {
                         self.toggle();
+                    }
+                } else if openers::find(&self.openers, &path).is_some() {
+                    // An opener outranks the custom editor (a terminal editor
+                    // on a PDF shows bytes), and runs once per double click:
+                    // there is no preview tab for the second click to pin.
+                    if !double {
+                        self.open_with_opener(&path);
                     }
                 } else if self.sidebar_state.custom_editor_on_click
                     && actions::configured_editor().is_some()
@@ -3658,13 +3707,7 @@ impl App {
         let Some(launcher) = self.launchers.get(index).cloned() else {
             return;
         };
-        let target = self.pane_ctl.as_ref().and_then(|ctl| {
-            let list = ipc::call_text("pane.list", serde_json::json!({})).ok()?;
-            let layout =
-                ipc::call_text("pane.layout", serde_json::json!({ "pane_id": ctl.pane_id }))
-                    .ok()?;
-            launchers::target_pane(&list, &layout, &ctl.pane_id)
-        });
+        let target = self.launch_target();
         self.notice = Some(match launchers::spawn(&launcher, target) {
             Ok(()) => format!("{}: opening", launcher.title),
             Err(err) => err,
