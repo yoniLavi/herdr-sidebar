@@ -3,6 +3,7 @@
 //! activity bar switches between them IN PROCESS (instant, no flash); in
 //! separated mode the same binary runs one pane per view, pinned with
 //! `--view explorer|git`. `--preview <ctl>` runs the file-preview pane.
+//! `--open <path>[:line]` shows a file from another pane (`open.rs`).
 //!
 //! The native `--ensure` / `--toggle*` modes drive pane lifecycle; the other
 //! `--*` stdin→stdout helpers expose the unit-tested launch calculations.
@@ -46,6 +47,16 @@ fn main() -> std::io::Result<()> {
             return ensure::run(ensure::Mode::Activate(ensure::Target::QuickOpen));
         }
         Some("--run-custom-editor") => return herdr_sidebar::actions::run_configured_editor(),
+        Some("--open") => match herdr_sidebar::open::run(std::env::args().nth(2)) {
+            Ok(done) => {
+                println!("{done}");
+                return Ok(());
+            }
+            Err(refused) => {
+                eprintln!("herdr-sidebar: {refused}");
+                std::process::exit(1);
+            }
+        },
         Some("--launch-decision") => {
             // Optional second arg picks the source-control decision; default
             // is the explorer/sidebar decision.
@@ -167,7 +178,7 @@ fn main() -> std::io::Result<()> {
         Some(other) => {
             eprintln!("herdr-sidebar: unknown argument `{other}`");
             eprintln!(
-                "usage: herdr-sidebar [--view explorer|git|--preview [ctl]|--run-custom-editor|--ensure|--toggle|--toggle-git|--show-explorer|--show-search|--show-git|--quick-open|--launch-decision [git]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--auto-open|--focus-on-open|--dock-right]"
+                "usage: herdr-sidebar [--view explorer|git|--preview [ctl]|--open <path>[:line]|--run-custom-editor|--ensure|--toggle|--toggle-git|--show-explorer|--show-search|--show-git|--quick-open|--launch-decision [git]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--auto-open|--focus-on-open|--dock-right]"
             );
             std::process::exit(2);
         }

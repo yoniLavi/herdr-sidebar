@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# herdr-open <path>[:line]: show a file in this pane's tab, in the sidebar's viewer.
+#
+# A wrapper because the sidebar's binary lives in herdr's plugin directory, not on PATH,
+# and that directory is herdr's to name. Asking herdr each time means a reinstall or an
+# upgrade needs nothing done here. The behavior, and the exit status a caller should act
+# on, are the binary's: see "Opening a file from an agent" in the repository README.
+set -euo pipefail
+
+root=$("${HERDR_BIN_PATH:-herdr}" plugin list --json |
+  jq -r '.result.plugins[] | select(.plugin_id == "herdr-sidebar") | .plugin_root')
+if [ -z "$root" ]; then
+  echo "herdr-open: the herdr-sidebar plugin is not installed" >&2
+  exit 1
+fi
+exec "$root/target/release/herdr-sidebar" --open "$@"

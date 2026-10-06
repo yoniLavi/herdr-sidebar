@@ -140,6 +140,24 @@ malformed file says so in the footer. Run `redeploy` after editing it.
 [`contrib/open-pdf`](contrib/open-pdf) is the command in that example: it shows a PDF in
 pdf.js inside [terminal-browser](https://github.com/zenbu-labs/terminal-browser).
 
+### Opening a file from an agent
+
+`herdr-sidebar --open <path>[:line]`, run from any pane, shows that file in the pane's own
+tab. It is meant for an agent that wants to put a file in front of you, so it is careful
+in ways a click is not:
+
+- It always uses the viewer above your main pane, whatever **Preview opens in** says, and
+  reuses the tab's viewer if there is one.
+- It never takes focus. Starting a viewer has to move focus for a moment, so it only does
+  that in the tab you are looking at; in any other tab it reuses an existing viewer or
+  refuses.
+- It refuses while that viewer is in edit mode, saved or not, and changes nothing.
+- Openers apply, so a PDF still goes to your own command.
+
+It exits 0 with one line on stdout when the file is showing, and 1 with the reason on
+stderr when it is not. [`contrib/agent-open`](contrib/agent-open) has a wrapper that finds
+the installed binary and a Claude Code skill that tells an agent when to use it.
+
 ## Keys
 
 | Explorer / Search | Action | Source Control | Action |

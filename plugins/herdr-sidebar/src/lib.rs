@@ -16,6 +16,7 @@ pub mod icons;
 pub mod ipc;
 pub mod launch;
 pub mod launchers;
+pub mod open;
 pub mod openers;
 pub mod rundir;
 pub mod snooze;

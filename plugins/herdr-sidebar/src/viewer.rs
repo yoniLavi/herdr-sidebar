@@ -1450,6 +1450,8 @@ fn report_identity(mode: &ViewMode, doc_key: Option<&str>, control: &Path) {
         METADATA_SOURCE: crate::state::unix_now().to_string(),
         TOKEN_PATH: doc_token,
         TOKEN_CONTROL: control_token,
+        // An explicit null clears it: `pane.report_metadata` merges.
+        TOKEN_EDITING: matches!(mode, ViewMode::Edit(_)).then_some("1"),
     });
     if inline {
         // We share the tab with the sidebar and whatever the user put there.
@@ -2327,7 +2329,96 @@ pub fn open_in_pane(
     payload: &str,
 ) -> Result<PreviewTarget, String> {
     let state = crate::state::load_state();
-    let inline = state.preview_placement.is_inline();
+    route(
+        my_pane_id,
+        spawn_cwd,
+        doc_key,
+        payload,
+        &state,
+        state.preview_placement,
+        false,
+    )
+}
+
+/// Open `payload` for a caller that is NOT the sidebar: `--open`, run by an
+/// agent from its own pane. Three things differ from a click, all because
+/// nobody asked for this with their hands on the keyboard:
+///
+/// - It always uses the tab's inline viewer, stacked above the largest work
+///   pane, whatever `Preview placement` says. Tab placement would move the
+///   client to another tab.
+/// - It refuses while that viewer is in edit mode, leaving the control file
+///   alone. A click may interrupt an editor because the person clicking is
+///   the one editing.
+/// - It never takes focus. Steering an existing viewer moves none. Starting
+///   one does, briefly: stacking it on top needs a `pane.swap`, and a swap
+///   moves the server's focus to the tab it happens in, whichever pane is
+///   named first (measured on herdr 0.9.3; `pane.move` within one tab is a
+///   no-op, so there is no quieter way up). Inside the tab in view that is a
+///   flicker this hands back. From any other tab it would carry the client
+///   across workspaces, and handing focus back afterwards loses a race with
+///   the client, so a background tab with no viewer yet is refused instead.
+///
+/// There is no beside-the-sidebar fallback either: that geometry is computed
+/// from the sidebar's own pane, and the caller here is somebody else's.
+pub fn open_above(
+    caller_pane_id: &str,
+    spawn_cwd: &Path,
+    doc_key: &str,
+    payload: &str,
+) -> Result<PreviewTarget, String> {
+    let state = crate::state::load_state();
+    route(
+        caller_pane_id,
+        spawn_cwd,
+        doc_key,
+        payload,
+        &state,
+        crate::state::PreviewPlacement::Above,
+        true,
+    )
+}
+
+/// The refusal an outside caller gets while a viewer it would steer is in
+/// edit mode. `previews` is already narrowed to the caller's tab.
+fn editing_refusal(previews: &[PreviewPane]) -> Option<String> {
+    let label = previews
+        .iter()
+        .find_map(|preview| preview.editing.as_deref())?;
+    let name = label.strip_suffix(" · editor").unwrap_or(label);
+    Some(format!(
+        "not opened: this tab's viewer has `{name}` open for editing, and nothing was changed"
+    ))
+}
+
+/// The refusal an outside caller gets when its tab has no viewer and is not
+/// the tab holding focus (see [`open_above`] for why starting one is unsafe).
+fn background_spawn_refusal(pane_list_json: &str, caller_tab_id: &str) -> Option<String> {
+    let focused = crate::launch::server_focused_pane_id(pane_list_json);
+    (crate::launch::tab_of(pane_list_json, &focused) != caller_tab_id).then(|| {
+        "not opened: this tab has no viewer yet and is not the tab in view, \
+         so starting one would take focus; nothing was changed"
+            .to_string()
+    })
+}
+
+/// The pane to hand focus back to after an outside caller's spawn, if the
+/// spawn moved it. `None` when focus is where it was, or was nowhere.
+fn focus_to_restore(focused_before: &str, pane_list_after: &str) -> Option<String> {
+    let now = crate::launch::server_focused_pane_id(pane_list_after);
+    (!focused_before.is_empty() && now != focused_before).then(|| focused_before.to_string())
+}
+
+fn route(
+    my_pane_id: &str,
+    spawn_cwd: &Path,
+    doc_key: &str,
+    payload: &str,
+    state: &crate::state::State,
+    placement: crate::state::PreviewPlacement,
+    outside: bool,
+) -> Result<PreviewTarget, String> {
+    let inline = placement.is_inline();
     let list = ipc::call_text("pane.list", serde_json::json!({}))
         .map_err(|e| format!("preview failed: {e}"))?;
     let caller_tab_id = crate::launch::tab_of(&list, my_pane_id);
@@ -2358,6 +2449,9 @@ pub fn open_in_pane(
     previews
         .retain(|preview| preview.inline == inline && (!inline || preview.tab_id == caller_tab_id));
     let origin_tab_id = preview_origin_tab(&previews, &caller_tab_id);
+    if outside && let Some(refusal) = editing_refusal(&previews) {
+        return Err(refusal);
+    }
 
     // 1. Already open — jump to it, pinned or not.
     if let Some(p) = preview_for_doc(&previews, doc_key) {
@@ -2391,8 +2485,12 @@ pub fn open_in_pane(
 
     // 3. Nothing reusable — a pane beside the sidebar (or above the tab's
     // main pane), or a tab of its own.
+    if outside && let Some(refusal) = background_spawn_refusal(&list, &caller_tab_id) {
+        return Err(refusal);
+    }
     if inline {
-        let above_of = work_panes_for(state.preview_placement, &list, &caller_tab_id);
+        let above_of = work_panes_for(placement, &list, &caller_tab_id);
+        let focused_before = crate::launch::server_focused_pane_id(&list);
         spawn_inline_pane(
             my_pane_id,
             spawn_cwd,
@@ -2405,6 +2503,7 @@ pub fn open_in_pane(
                 above_of: above_of.as_deref(),
                 above_percent: state.above_percent,
             },
+            outside.then_some(focused_before.as_str()),
         )
     } else {
         spawn_preview_tab(my_pane_id, spawn_cwd, doc_key, payload, &origin_tab_id)
@@ -2517,13 +2616,30 @@ fn spawn_inline_pane(
     payload: &str,
     caller_tab_id: &str,
     inline: InlineSpawn,
+    outside_focused_before: Option<&str>,
 ) -> Result<PreviewTarget, String> {
-    let (new_pane, control) =
-        spawn_viewer_pane(my_pane_id, spawn_cwd, doc_key, payload, Some(inline))?;
+    let (new_pane, control) = spawn_viewer_pane(
+        my_pane_id,
+        spawn_cwd,
+        doc_key,
+        payload,
+        Some(inline),
+        outside_focused_before.is_some(),
+    )?;
     // A swap moves the FOCUSED SLOT's occupant, not the focus: when the plan
     // swapped us out of our own slot, focus is now sitting on the brand-new
     // pane. Put it back before the shell there starts consuming keystrokes.
-    let _ = ipc::call_text("pane.focus", serde_json::json!({ "pane_id": my_pane_id }));
+    // An outside caller is not necessarily where the user is, so it restores
+    // whatever was focused, and only when the spawn actually moved it.
+    let refocus = match outside_focused_before {
+        None => Some(my_pane_id.to_string()),
+        Some(before) => ipc::call_text("pane.list", serde_json::json!({}))
+            .ok()
+            .and_then(|after| focus_to_restore(before, &after)),
+    };
+    if let Some(pane_id) = refocus {
+        let _ = ipc::call_text("pane.focus", serde_json::json!({ "pane_id": pane_id }));
+    }
     remember_origin(&new_pane, caller_tab_id);
     if !start_viewer_pane(&new_pane) {
         cleanup_spawn(&new_pane, &control);
@@ -2643,6 +2759,11 @@ pub const TOKEN_ORIGIN_TAB: &str = "hs-preview-origin-tab";
 /// the pane was split in). Routing needs it on the PANE so flipping the
 /// setting cannot hand a tab-mode click an inline pane, or the reverse.
 pub const TOKEN_INLINE: &str = "hs-preview-inline";
+/// The viewer is in edit mode, dirty or not. Stamped by the viewer itself and
+/// cleared when it returns to a preview, so a caller that must not disturb an
+/// open editor (`open_above`) can refuse BEFORE writing the control file; the
+/// unsaved-changes prompt only fires after the switch has been requested.
+pub const TOKEN_EDITING: &str = "hs-preview-editing";
 
 /// A live preview pane and the document it is showing. State lives on the
 /// pane, so it cannot outlive what it describes.
@@ -2665,6 +2786,9 @@ pub struct PreviewPane {
     /// Herdr restored the pane label but not its process metadata. This is a
     /// dead shell left behind by server resume, not a live unsaved editor.
     pub resumed: bool,
+    /// The pane's label while its viewer is in edit mode (see
+    /// [`TOKEN_EDITING`]), which names the file for whoever is refused.
+    pub editing: Option<String>,
 }
 
 /// Every preview pane in the session, from one `pane.list` payload.
@@ -2712,6 +2836,11 @@ fn previews_in(pane_list_json: &str) -> Vec<PreviewPane> {
                 })
                 .unwrap_or_default();
             let pane_id = p.pane_id?;
+            let editing = p
+                .tokens
+                .get(TOKEN_EDITING)
+                .is_some_and(|value| !value.is_null())
+                .then(|| p.label.clone().unwrap_or_else(|| "a file".into()));
             let control = p
                 .tokens
                 .get(TOKEN_CONTROL)
@@ -2747,6 +2876,7 @@ fn previews_in(pane_list_json: &str) -> Vec<PreviewPane> {
                     .unwrap_or_default()
                     .to_string(),
                 resumed,
+                editing,
             })
         })
         .collect()
@@ -3039,10 +3169,9 @@ fn spawn_viewer_pane(
     doc_key: &str,
     payload: &str,
     inline: Option<InlineSpawn>,
+    above_only: bool,
 ) -> Result<(String, PathBuf), String> {
     crate::rundir::ensure_private(&scratch_dir()).map_err(|e| format!("preview failed: {e}"))?;
-    let control = fresh_control_path();
-    write_scratch_file(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
     let layout = ipc::call_text("pane.layout", serde_json::json!({ "pane_id": my_pane_id })).ok();
     let above = inline.and_then(|inline| {
         let work = inline.above_of?;
@@ -3050,6 +3179,11 @@ fn spawn_viewer_pane(
             .as_deref()
             .and_then(|json| above_split_plan(json, work, inline.above_percent))
     });
+    if above_only && above.is_none() {
+        return Err("not opened: no pane in this tab is tall enough to put a viewer above".into());
+    }
+    let control = fresh_control_path();
+    write_scratch_file(&control, payload).map_err(|e| format!("preview failed: {e}"))?;
     let plan = split_plan(layout.as_deref(), my_pane_id, inline, above);
     let new_pane = ipc::call_text(
         "pane.split",
@@ -4236,6 +4370,93 @@ mod tests {
         );
         assert!(reusable_preview(&previews, true).is_some());
         assert!(reusable_preview(&previews, false).is_none());
+    }
+
+    /// The refusal is keyed on the viewer's own edit-mode stamp, and names the
+    /// file through the pane label. A preview that merely shows a file, pinned
+    /// or not, refuses nothing.
+    #[test]
+    fn an_outside_caller_is_refused_only_while_the_viewer_is_editing() {
+        let pane = |extra: &str| {
+            format!(
+                r#"{{"result":{{"panes":[
+                {{"pane_id":"w4:p2","tab_id":"w4:t1","workspace_id":"w4",
+                  "label":"notes.md · editor",
+                  "tokens":{{"herdr-sidebar-preview":"9999999999",
+                            "hs-preview-path":"/r/notes.md","hs-preview-inline":"1"{extra}}}}}
+                ]}}}}"#
+            )
+        };
+        let editing = previews_in(&pane(r#","hs-preview-editing":"1""#));
+        assert_eq!(editing[0].editing.as_deref(), Some("notes.md · editor"));
+        let refusal = editing_refusal(&editing).expect("an editor must refuse");
+        assert!(refusal.contains("`notes.md` open for editing"), "{refusal}");
+
+        let previewing = previews_in(&pane(""));
+        assert_eq!(previewing[0].editing, None);
+        assert_eq!(editing_refusal(&previewing), None);
+        assert_eq!(
+            editing_refusal(&previews_in(&pane(r#","hs-preview-pinned":"1""#))),
+            None
+        );
+    }
+
+    /// The viewer clears the stamp with an explicit null on leaving edit mode
+    /// (`pane.report_metadata` merges), and herdr then drops the key. A null
+    /// that did survive in `pane.list` must still read as "not editing".
+    #[test]
+    fn a_cleared_editing_stamp_is_not_an_editor() {
+        let cleared = r#"{"result":{"panes":[
+            {"pane_id":"w4:p2","tab_id":"w4:t1","workspace_id":"w4",
+             "tokens":{"herdr-sidebar-preview":"9999999999","hs-preview-path":"/r/a.rs",
+                       "hs-preview-inline":"1","hs-preview-editing":null}}
+        ]}}"#;
+        assert_eq!(previews_in(cleared)[0].editing, None);
+    }
+
+    #[test]
+    fn an_outside_caller_may_start_a_viewer_only_in_the_tab_holding_focus() {
+        let list = |focused_tab_pane: &str| {
+            format!(
+                r#"{{"result":{{"panes":[
+                {{"pane_id":"w1:p1","tab_id":"w1:t1","focused":{}}},
+                {{"pane_id":"w1:p2","tab_id":"w1:t1","focused":false}},
+                {{"pane_id":"w2:p1","tab_id":"w2:t1","focused":{}}}
+                ]}}}}"#,
+                focused_tab_pane == "w1:p1",
+                focused_tab_pane == "w2:p1"
+            )
+        };
+        // Focus anywhere in the caller's tab is enough; it need not be on the caller.
+        assert_eq!(background_spawn_refusal(&list("w1:p1"), "w1:t1"), None);
+        assert!(background_spawn_refusal(&list("w2:p1"), "w1:t1").is_some());
+        // Nothing focused at all: nobody is looking at this tab either.
+        assert!(background_spawn_refusal(&list(""), "w1:t1").is_some());
+    }
+
+    #[test]
+    fn an_outside_spawn_restores_focus_only_when_it_moved() {
+        let focused = |id: &str| {
+            format!(
+                r#"{{"result":{{"panes":[
+                {{"pane_id":"w1:p1","tab_id":"w1:t1","focused":{}}},
+                {{"pane_id":"w1:p9","tab_id":"w1:t1","focused":{}}}
+                ]}}}}"#,
+                id == "w1:p1",
+                id == "w1:p9"
+            )
+        };
+        assert_eq!(focus_to_restore("w1:p1", &focused("w1:p1")), None);
+        assert_eq!(
+            focus_to_restore("w1:p1", &focused("w1:p9")),
+            Some("w1:p1".into()),
+            "the swap left focus on the new viewer"
+        );
+        assert_eq!(
+            focus_to_restore("", &focused("w1:p9")),
+            None,
+            "nothing was focused before, so there is nothing to give it back to"
+        );
     }
 
     #[test]

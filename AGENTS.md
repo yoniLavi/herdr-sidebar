@@ -496,6 +496,30 @@ HACKING.md — budget time for that before promising a patched build.
   opener never created — falling through would run the command twice. Explorer only:
   the Source Control view previews diffs, which is still the right thing for a tracked
   binary.
+- **`--open <path>[:line]`** (`open.rs`, behavior in the README) is the one preview caller
+  that is NOT the sidebar: an agent runs it from its own pane. It goes through
+  `viewer::open_above`, which shares `route` with `open_in_pane`, so the two cannot
+  disagree about which viewer a tab has. What differs is on `open_above`'s doc comment.
+  Findings behind it, all measured on herdr 0.9.3 on 2026-10-06:
+  - **`pane.swap` moves the server's focus into the tab it happens in**, to the new pane
+    with `source=new,target=old` and to the old one the other way round. In a background
+    tab that carries the attached client across workspaces. Restoring focus afterwards
+    works on a server with no client and LOSES on a real one (focus ended on the
+    background tab's work pane), so `--open` refuses to start a viewer outside the
+    focused tab rather than swap and repair.
+  - **`pane.move` with a same-tab destination returns `ok` and changes nothing**, so it
+    is not a focus-free way to put a pane above another. `split` accepts only `right`
+    and `down`.
+  - Observed alongside, not investigated: `tab create --no-focus` and
+    `workspace create --no-focus` both ended with focus in the new tab a moment later.
+    The quiet `--ensure` hook docks a sidebar there and its left-dock path swaps too,
+    which would explain it.
+  - The edit-mode refusal reads `hs-preview-editing`, which only viewers from above.10 on
+    stamp. A viewer left running from an older build never refuses.
+  - Test this against a throwaway server, not the session you are sitting in:
+    `herdr --session <name> server` (with the `HERDR_*` variables unset) gives an
+    isolated socket under `~/.config/herdr/sessions/<name>/`, plugins included. It shows
+    server-side focus only; what an attached client does with it needs a real session.
 - User-facing wording is **"Unified sidebar: on/off"**, toggled in the ⚙ Settings modal
   (`s` key or the gear button) — never "merge"/"detach" in UI text, and the toggle is
   silent (the layout change is the feedback). Off spawns a second pane of the same binary
