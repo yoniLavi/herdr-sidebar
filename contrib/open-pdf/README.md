@@ -5,6 +5,15 @@ Shows a PDF in [pdf.js](https://mozilla.github.io/pdf.js/) inside
 agent. It is the command behind the sidebar's `openers.json` example, and works on its
 own from any shell: `open-pdf report.pdf`.
 
+**Scrolling is the weak point, and it may rule this out for you.** Measured 2026-10-06
+with terminal-browser 0.13.1 inside herdr 0.9.3 on Ghostty 1.3.1: the browser renders at
+60 fps, but each frame reaches Ghostty as inline image data and Ghostty absorbs only
+about 6-7 full frames a second at a 1774x858 pane. Scrolling repaints the whole frame, so
+the surplus queues and replays for seconds after you stop, and other panes lag behind it.
+`terminal-browser config set render.fps 10` trades smoothness for a short tail; nothing
+on this side removes it. If you read rather than glance, an opener of
+`["open", "-a", "Google Chrome"]` is the better choice today.
+
 Why it needs a small local server, what that server will and will not hand out, and the
 tunables are at the top of [`open_pdf.py`](open_pdf.py).
 
