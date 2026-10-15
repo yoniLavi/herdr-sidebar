@@ -9,6 +9,8 @@
 //! - `follow_cwd`: follow the live cwd of the neighbouring pane.
 //! - `dock_right`: dock at the right edge instead of the default left edge.
 //! - `sidebar_width`: preferred sidebar width in terminal columns.
+//! - `above_percent`: under `above` preview placement, the viewer's share of
+//!   the pane it is stacked over.
 //!
 //! Both views live in ONE binary; switching is an in-process re-render, and
 //! separated panes are the same binary pinned to a starting view with
@@ -27,6 +29,30 @@ pub const SIDEBAR_WIDTH_STEP: u16 = 4;
 
 pub fn clamp_sidebar_width(width: u16) -> u16 {
     width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH)
+}
+
+/// `above` placement: the viewer's share of the pane it is stacked over, as a
+/// percentage. The bounds keep both panes usable at the extremes; the viewer
+/// also yields on a short pane, which is a row count rather than a share and
+/// lives with the geometry in `viewer.rs`.
+pub const DEFAULT_ABOVE_PERCENT: u16 = 60;
+pub const MIN_ABOVE_PERCENT: u16 = 20;
+pub const MAX_ABOVE_PERCENT: u16 = 80;
+pub const ABOVE_PERCENT_STEP: u16 = 5;
+
+pub fn clamp_above_percent(percent: u16) -> u16 {
+    percent.clamp(MIN_ABOVE_PERCENT, MAX_ABOVE_PERCENT)
+}
+
+pub fn step_above_percent(percent: u16, taller: bool) -> u16 {
+    let percent = clamp_above_percent(percent);
+    if taller {
+        (percent + ABOVE_PERCENT_STEP).min(MAX_ABOVE_PERCENT)
+    } else {
+        percent
+            .saturating_sub(ABOVE_PERCENT_STEP)
+            .max(MIN_ABOVE_PERCENT)
+    }
 }
 
 pub fn step_sidebar_width(width: u16, wider: bool) -> u16 {
@@ -56,7 +82,8 @@ pub const SPAWN_CWD_ENV: &str = "HERDR_SIDEBAR_SPAWN_CWD";
 pub const PREVIEW_CONTROL_ENV: &str = "HERDR_SIDEBAR_PREVIEW_CONTROL";
 
 /// Set on viewer panes spawned into the sidebar's own tab
-/// ([`PreviewPlacement::Pane`]). A viewer's placement is fixed by where its
+/// ([`PreviewPlacement::Pane`], [`PreviewPlacement::Replace`]'s takeover
+/// viewer, or [`PreviewPlacement::Above`]). A viewer's placement is fixed by where its
 /// pane physically sits, so it travels with the process rather than being
 /// re-read from the settings file, which the user can flip mid-life.
 pub const PREVIEW_INLINE_ENV: &str = "HERDR_SIDEBAR_PREVIEW_INLINE";
@@ -64,6 +91,16 @@ pub const PREVIEW_INLINE_ENV: &str = "HERDR_SIDEBAR_PREVIEW_INLINE";
 /// One-shot activity requested by a host-level action while opening a fresh
 /// sidebar pane.
 pub const INITIAL_ACTIVITY_ENV: &str = "HERDR_SIDEBAR_INITIAL_ACTIVITY";
+
+/// Opt-in (`1`) for a Source Control pane that keeps polling Git status while
+/// unfocused. Meant for panes used as a passive "what changed" monitor next to
+/// an agent; by default an unfocused pane backs off to save `git status` runs.
+pub const BACKGROUND_REFRESH_ENV: &str = "HERDR_SIDEBAR_BACKGROUND_REFRESH";
+
+/// Whether a [`BACKGROUND_REFRESH_ENV`] value enables background refresh.
+pub fn background_refresh_enabled(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1"))
+}
 
 /// Unix seconds now — the heartbeat clock for pane identity tokens.
 pub fn unix_now() -> u64 {
@@ -216,12 +253,16 @@ impl ColorTheme {
 
 /// Where a preview, diff or `git show` opens. `Tab` gives every document its
 /// own herdr tab (VS Code editor-tab semantics, the historical default);
-/// `Pane` splits ONE viewer pane into the tab the sidebar already lives in
-/// and reuses it for every later click.
+/// `Pane` splits ONE viewer pane into the tab the sidebar already lives in,
+/// beside the sidebar, and reuses it for every later click. `Above` is the
+/// same single inline viewer, split in above the tab's main pane instead, so
+/// that pane (typically an agent) keeps its full width.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PreviewPlacement {
     Tab,
     Pane,
+    Replace,
+    Above,
 }
 
 impl PreviewPlacement {
@@ -229,25 +270,41 @@ impl PreviewPlacement {
         match self {
             Self::Tab => "tab",
             Self::Pane => "pane",
+            Self::Replace => "replace",
+            Self::Above => "above",
         }
     }
 
+    /// The value the ⚙ settings row moves to next; the row cycles in place.
     pub fn other(self) -> Self {
         match self {
             Self::Tab => Self::Pane,
-            Self::Pane => Self::Tab,
+            Self::Pane => Self::Replace,
+            Self::Replace => Self::Above,
+            Self::Above => Self::Tab,
         }
     }
 
     /// True when previews share the caller's tab instead of getting one.
+    /// `Pane`, `Replace` and `Above` all keep one viewer per tab, and each
+    /// reuses a viewer the others left; `Pane` and `Above` differ only in
+    /// where a NEW viewer is split in.
     pub fn is_inline(self) -> bool {
-        matches!(self, Self::Pane)
+        matches!(self, Self::Pane | Self::Replace | Self::Above)
+    }
+
+    /// Split the inline viewer in above the tab's main pane rather than
+    /// beside the sidebar.
+    pub fn stacks_above(self) -> bool {
+        matches!(self, Self::Above)
     }
 
     fn from_state_name(name: &str) -> Option<Self> {
         match name {
             "tab" => Some(Self::Tab),
             "pane" => Some(Self::Pane),
+            "replace" => Some(Self::Replace),
+            "above" => Some(Self::Above),
             _ => None,
         }
     }
@@ -303,12 +360,18 @@ pub struct State {
     /// column target in the normal range and yields proportionally when the
     /// tab becomes unusually narrow.
     pub sidebar_width: u16,
-    /// Whether a clicked file opens in its own tab or in a viewer pane beside
-    /// the sidebar, inside the tab the click came from.
+    /// Under `above` preview placement, the viewer's percentage share of the
+    /// pane it is stacked over. Ignored by the other placements.
+    pub above_percent: u16,
+    /// Whether a clicked file opens in its own tab or in a viewer pane inside
+    /// the tab the click came from (beside the sidebar, above the work pane,
+    /// or as a temporary takeover).
     pub preview_placement: PreviewPlacement,
     /// Replace mouse-click previews with the configured terminal editor.
     /// Keyboard Enter always retains the built-in preview path.
     pub custom_editor_on_click: bool,
+    /// View mode in Source Control: true for hierarchical tree view, false for flat list view.
+    pub scm_tree_view: bool,
 }
 
 impl Default for State {
@@ -329,8 +392,10 @@ impl Default for State {
             git_deco: true,
             dock_right: false,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            above_percent: DEFAULT_ABOVE_PERCENT,
             preview_placement: PreviewPlacement::Tab,
             custom_editor_on_click: false,
+            scm_tree_view: false,
         }
     }
 }
@@ -382,7 +447,7 @@ pub fn save_editor_command(command: &str) -> bool {
     std::fs::write(path, command).is_ok()
 }
 
-fn state_dir() -> Option<PathBuf> {
+pub(crate) fn state_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("HERDR_PLUGIN_STATE_DIR")
         && !dir.is_empty()
     {
@@ -496,7 +561,7 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"above_percent\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.search_active,
@@ -510,9 +575,11 @@ fn write_state(path: &Path, state: State) {
         state.git_deco,
         state.dock_right,
         clamp_sidebar_width(state.sidebar_width),
+        clamp_above_percent(state.above_percent),
         state.color_theme.label(),
         state.preview_placement.label(),
-        state.custom_editor_on_click
+        state.custom_editor_on_click,
+        state.scm_tree_view
     );
     let _ = std::fs::write(path, json);
 }
@@ -662,6 +729,9 @@ pub struct ScmState {
     /// Draft roots this pane previously observed and has since emptied.
     /// Kept out of the JSON shape; it only scopes merge-on-write removals.
     pub cleared_drafts: std::collections::BTreeSet<String>,
+    /// Tree-view folders the user collapsed, as JSON `(repo root, staged,
+    /// path)` triples. The tree/list MODE itself is global (`scm_tree_view`).
+    pub collapsed_dirs: Vec<String>,
 }
 
 fn scm_path() -> Option<PathBuf> {
@@ -708,6 +778,15 @@ fn scm_state_for(file: &ScmFile, cwd: &Path) -> ScmState {
                 .collect()
         })
         .unwrap_or_default();
+    let collapsed_dirs = entry
+        .get("collapsed_dirs")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
     ScmState {
         drawers,
         active_root: entry
@@ -738,6 +817,7 @@ fn scm_state_for(file: &ScmFile, cwd: &Path) -> ScmState {
             })
             .unwrap_or_default(),
         cleared_drafts: std::collections::BTreeSet::new(),
+        collapsed_dirs,
     }
 }
 
@@ -778,6 +858,7 @@ pub fn save_scm_state(cwd: &Path, state: &ScmState) -> bool {
             "history_target": state.history_target,
             "scroll": state.scroll,
             "drafts": drafts,
+            "collapsed_dirs": state.collapsed_dirs,
         }),
     );
     serde_json::to_string(&file)
@@ -934,6 +1015,12 @@ pub fn parse_state(json: &str) -> State {
             .and_then(|v| u16::try_from(v).ok())
             .map(clamp_sidebar_width)
             .unwrap_or(default.sidebar_width),
+        above_percent: value
+            .get("above_percent")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u16::try_from(v).ok())
+            .map(clamp_above_percent)
+            .unwrap_or(default.above_percent),
         preview_placement: value
             .get("preview_placement")
             .and_then(|v| v.as_str())
@@ -943,6 +1030,10 @@ pub fn parse_state(json: &str) -> State {
             .get("custom_editor_on_click")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.custom_editor_on_click),
+        scm_tree_view: value
+            .get("scm_tree_view")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.scm_tree_view),
     }
 }
 
@@ -1085,10 +1176,12 @@ mod tests {
             git_deco: false,
             dock_right: true,
             sidebar_width: 44,
+            above_percent: 45,
             preview_placement: PreviewPlacement::Pane,
             custom_editor_on_click: true,
+            scm_tree_view: true,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"above_percent\":45,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git
@@ -1144,8 +1237,35 @@ mod tests {
             parse_state("{\"preview_placement\":\"nonsense\"}").preview_placement,
             PreviewPlacement::Tab
         );
+        assert_eq!(
+            parse_state("{\"preview_placement\":\"above\"}").preview_placement,
+            PreviewPlacement::Above
+        );
         assert_eq!(parse_state("garbage"), State::default());
         assert_eq!(parse_state("{\"active\":\"bogus\"}"), State::default());
+        assert!(parse_state("{\"scm_tree_view\":true}").scm_tree_view);
+    }
+
+    #[test]
+    fn scm_state_roundtrips_collapsed_dirs_and_ignores_legacy_tree_view() {
+        let json = r#"{"/repo/project":{"tree_view":true,"collapsed_dirs":["src","tests"]}}"#;
+        let file = decode_scm_file(json);
+        let st = scm_state_for(&file, Path::new("/repo/project"));
+        assert_eq!(st.collapsed_dirs, vec!["src", "tests"]);
+    }
+
+    #[test]
+    fn preview_cycle_keeps_tab_default_and_persists_takeover() {
+        assert_eq!(State::default().preview_placement, PreviewPlacement::Tab);
+        assert_eq!(PreviewPlacement::Tab.other(), PreviewPlacement::Pane);
+        assert_eq!(PreviewPlacement::Pane.other(), PreviewPlacement::Replace);
+        assert_eq!(PreviewPlacement::Replace.other(), PreviewPlacement::Above);
+        assert_eq!(PreviewPlacement::Above.other(), PreviewPlacement::Tab);
+        assert_eq!(
+            parse_state(r#"{"preview_placement":"replace"}"#).preview_placement,
+            PreviewPlacement::Replace
+        );
+        assert!(PreviewPlacement::Replace.is_inline());
     }
 
     #[test]
@@ -1173,6 +1293,61 @@ mod tests {
             assert_eq!(follow_cwd_setting_value(true), "on");
             assert_eq!(follow_cwd_setting_value(false), "off");
         }
+    }
+
+    /// The `above` share steps and saturates like the sidebar width it sits
+    /// beside, and a file asking for something absurd is clamped rather than
+    /// obeyed — the viewer or the pane below would otherwise vanish.
+    #[test]
+    fn above_percent_steps_and_saturates_within_supported_bounds() {
+        assert_eq!(step_above_percent(60, true), 65);
+        assert_eq!(step_above_percent(60, false), 55);
+        assert_eq!(
+            step_above_percent(MAX_ABOVE_PERCENT, true),
+            MAX_ABOVE_PERCENT
+        );
+        assert_eq!(
+            step_above_percent(MIN_ABOVE_PERCENT, false),
+            MIN_ABOVE_PERCENT
+        );
+        // Out-of-range input is clamped INTO range and then stepped, as the
+        // sidebar width does with the same shape.
+        assert_eq!(step_above_percent(1, true), 25);
+        assert_eq!(step_above_percent(u16::MAX, false), 75);
+        assert_eq!(parse_state("{\"above_percent\":45}").above_percent, 45);
+        assert_eq!(parse_state("{\"above_percent\":0}").above_percent, 20);
+        assert_eq!(parse_state("{\"above_percent\":900}").above_percent, 80);
+        // Files written before the setting existed keep the historical 60%.
+        assert_eq!(parse_state("{\"merged\":true}").above_percent, 60);
+    }
+
+    #[test]
+    fn preview_placement_cycles_through_every_value_and_round_trips() {
+        let all = [
+            PreviewPlacement::Tab,
+            PreviewPlacement::Pane,
+            PreviewPlacement::Replace,
+            PreviewPlacement::Above,
+        ];
+        for placement in all {
+            assert_eq!(
+                PreviewPlacement::from_state_name(placement.label()),
+                Some(placement)
+            );
+        }
+        // Four presses of the settings row visit every value once and land
+        // back where they started.
+        let mut seen = vec![PreviewPlacement::Tab];
+        let mut current = PreviewPlacement::Tab.other();
+        while current != PreviewPlacement::Tab {
+            seen.push(current);
+            current = current.other();
+        }
+        assert_eq!(seen, all);
+        assert!(!PreviewPlacement::Tab.is_inline());
+        assert!(PreviewPlacement::Pane.is_inline() && !PreviewPlacement::Pane.stacks_above());
+        assert!(PreviewPlacement::Replace.is_inline() && !PreviewPlacement::Replace.stacks_above());
+        assert!(PreviewPlacement::Above.is_inline() && PreviewPlacement::Above.stacks_above());
     }
 
     #[test]
