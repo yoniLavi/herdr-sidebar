@@ -976,10 +976,23 @@ setting are all gone.
 - `glow` receives the actual preview-body width and the configured light/dark color mode. Its
   terminal-formatted output bypasses the generic text wrapper; first-load and resize mismatches
   schedule one background reload at the new width while preserving the reader's scroll offset.
-- Raster image previews are decoded in-process and rendered as true-color `▀` cells (foreground
-  = upper pixel, background = lower pixel), so they work through herdr's terminal compositor
-  without Kitty/Sixel passthrough. They preserve aspect ratio, center, and rebuild from the
-  decoded source when the pane width or height changes. Common video extensions ask `ffmpeg`
+- Raster image previews are decoded in-process. When the pane answers a Kitty graphics query
+  (herdr 0.9.x with `kitty_graphics = true` does), the body is left blank and the image is
+  placed over it at full resolution (`src/kitty.rs`); otherwise it is rendered as true-color `▀`
+  cells (foreground = upper pixel, background = lower pixel), two pixels per cell.
+  `HERDR_SIDEBAR_IMAGES=blocks|kitty` overrides the query. Either way previews preserve aspect
+  ratio, center, and rebuild from the decoded source when the pane width or height changes.
+- **Inside herdr a Kitty image must be a direct placement, not a Unicode placeholder.** Verified
+  against herdr 0.9.5 by attaching a client to a throwaway `--session` server through a pty and
+  logging what it wrote: a direct `a=T` placement is re-emitted to the outer terminal (herdr
+  re-transmits the decoded pixels once, then re-sends `a=p` on each redraw), while a `U=1`
+  virtual placement plus `U+10EEEE` cells is accepted by the pane and **never forwarded**, so
+  it renders as nothing with no error anywhere. The pane reports real pixel geometry
+  (`TIOCGWINSZ` and `CSI 16 t`, from the attached client's outer terminal), which is what keeps
+  the aspect ratio right; with no pixel geometry the preview falls back to `▀` cells. Known
+  limit: the query is answered by herdr's per-pane terminal, not the outer one, so an outer
+  terminal without Kitty support (or `kitty_graphics = false`) gets a blank preview; set
+  `HERDR_SIDEBAR_IMAGES=blocks` there. Common video extensions ask `ffmpeg`
   for a bounded first-frame PNG and render it through the same path; lookup resolves an absolute
   executable from PATH while rejecting relative/project-local entries (Windows process lookup
   otherwise searches cwd first), and extraction has a 4s timeout plus a 16 MiB output cap.

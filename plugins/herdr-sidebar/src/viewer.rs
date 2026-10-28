@@ -369,8 +369,10 @@ struct Doc {
     lines: Vec<Line<'static>>,
     /// File previews get a line-number gutter; diffs carry their own +/-.
     numbered: bool,
-    /// Decoded raster media, rendered portably with true-color half blocks.
-    /// Video files carry the poster frame extracted by ffmpeg.
+    /// Decoded raster media: placed over blank cells with Kitty graphics when
+    /// the terminal supports it (see `crate::kitty`), otherwise rendered
+    /// portably with true-color half blocks. Video files carry the poster
+    /// frame extracted by ffmpeg.
     media: Option<MediaPreview>,
     /// Offset into [`Doc::rows`] — RENDERED rows, not source lines, so a
     /// wrapped line's continuations are scrolled to like anything else.
@@ -384,8 +386,9 @@ struct Doc {
     /// `lines` laid out for the pane, rebuilt only when the width or the
     /// wrap toggle changes (see [`Doc::relayout`]).
     rows: Vec<Row>,
-    /// The (width, height, wrap) `rows` was built for; `None` until first draw.
-    rows_key: Option<(u16, u16, bool)>,
+    /// The (width, height, wrap, Kitty-placed media) `rows` was built for;
+    /// `None` until first draw.
+    rows_key: Option<(u16, u16, bool, bool)>,
     /// Source line to scroll back to once `rows` is rebuilt — how a wrap
     /// toggle and a diff refresh keep the reader's place even though the
     /// row index underneath them changed.
@@ -394,6 +397,9 @@ struct Doc {
 }
 
 struct MediaPreview {
+    /// Distinct per load, so a Kitty placement is re-sent when the file is
+    /// reloaded from disk even though its rectangle did not move.
+    serial: u64,
     pixels: image::RgbaImage,
     source_width: u32,
     source_height: u32,
@@ -424,13 +430,16 @@ impl Doc {
     /// Rebuild [`Doc::rows`] for the viewport when the layout inputs changed,
     /// then honour any pending source-line scroll request.
     fn relayout(&mut self, width: u16, height: u16) {
-        if self.rows_key != Some((width, height, self.wrap)) {
-            self.rows = if let Some(media) = &self.media {
-                render_media_rows(media, width, height)
-            } else {
-                build_rows(&self.lines, self.numbered, self.wrap, width)
+        // Media under a Kitty placement gets blank rows; the run loop places
+        // the image over them after the frame is drawn.
+        let kitty = self.media.is_some() && kitty_cell().is_some();
+        if self.rows_key != Some((width, height, self.wrap, kitty)) {
+            self.rows = match &self.media {
+                Some(_) if kitty => Vec::new(),
+                Some(media) => render_media_rows(media, width, height),
+                None => build_rows(&self.lines, self.numbered, self.wrap, width),
             };
-            self.rows_key = Some((width, height, self.wrap));
+            self.rows_key = Some((width, height, self.wrap, kitty));
             self.selection = PreviewSelection::default();
         }
         if let Some(src) = self.pending_src.take() {
@@ -636,9 +645,24 @@ fn media_pixel(pixel: image::Rgba<u8>) -> Option<(u8, u8, u8)> {
     Some((blend(pixel[0]), blend(pixel[1]), blend(pixel[2])))
 }
 
-/// Render raster media without relying on terminal-specific image protocols.
-/// One `▀` cell carries an upper pixel in its foreground and a lower pixel in
-/// its background, giving the pane two vertical pixels per terminal row.
+/// Cell pixel size when media should be shown with Kitty graphics, `None`
+/// for the half-block fallback. Re-read on each relayout and placement,
+/// because pixel geometry vanishes while no herdr client is attached.
+fn kitty_cell() -> Option<(f64, f64)> {
+    crate::kitty::enabled()
+        .then(crate::kitty::cell_pixels)
+        .flatten()
+}
+
+fn next_media_serial() -> u64 {
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Fallback renderer for terminals without Kitty graphics (see
+/// `crate::kitty`). One `▀` cell carries an upper pixel in its foreground and
+/// a lower pixel in its background, giving the pane two vertical pixels per
+/// terminal row.
 fn render_media_rows(media: &MediaPreview, width: u16, height: u16) -> Vec<Row> {
     if width == 0 || height == 0 || media.source_width == 0 || media.source_height == 0 {
         return Vec::new();
@@ -1237,6 +1261,7 @@ fn load_media_file(target: &Path, name: String, video_poster: bool) -> Doc {
             (
                 Vec::new(),
                 Some(MediaPreview {
+                    serial: next_media_serial(),
                     pixels,
                     source_width,
                     source_height,
@@ -1731,6 +1756,8 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         crossterm::cursor::MoveTo(0, 0),
     );
     crossterm::style::force_color_output(true); // TUI colors ≠ pipeable output
+    crate::kitty::detect(); // reads the reply off stdin, so before the event loop
+    let mut placement = crate::kitty::Placement::default();
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let mut page: usize = 20;
@@ -1784,6 +1811,20 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         if let Err(e) = draw {
             break Err(e);
         }
+        let image = match &mode {
+            ViewMode::Preview(Doc {
+                media: Some(media), ..
+            }) => kitty_cell().and_then(|cell| {
+                let at = crate::kitty::fit(
+                    (media.source_width, media.source_height),
+                    preview_body,
+                    cell,
+                )?;
+                Some((media.serial, &media.pixels, at, cell))
+            }),
+            _ => None,
+        };
+        let _ = placement.sync(&mut std::io::stdout(), image);
         if identity_pending {
             report_identity(
                 &mode,
@@ -2146,6 +2187,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             last_diff_refresh = Instant::now();
         }
     };
+    let _ = placement.clear(&mut std::io::stdout());
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -3501,6 +3543,7 @@ mod tests {
         }
         let rows = render_media_rows(
             &MediaPreview {
+                serial: 0,
                 pixels,
                 source_width: 2,
                 source_height: 2,

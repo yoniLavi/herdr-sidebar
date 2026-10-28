@@ -14,6 +14,7 @@ pub mod git;
 pub mod gitdeco;
 pub mod icons;
 pub mod ipc;
+pub mod kitty;
 pub mod launch;
 pub mod launchers;
 pub mod open;
